@@ -303,6 +303,29 @@ async def _ask_server_tag_delayed(chat_id: int, user, delay: int = 30):
         pass
     await _ask_server_tag(chat_id, user)
 
+SERVER_DISPLAY_NAMES = {
+    "Ру": "Россия", "Крд": "Краснодар", "Мск": "Москва", "Еу": "Европа",
+    "Узб": "Узбекистан", "Екб": "Екатеринбург", "Укр": "Украина",
+    "Сиб": "Сибирь", "Дв": "Дальний Восток", "Вн": "Вьетнам",
+    "Кз": "Казахстан", "Бел": "Беларусь", "Мд": "Молдова",
+    "Кг": "Кыргызстан", "Аз": "Азербайджан", "Ам": "Армения",
+    "Гео": "Грузия", "Тж": "Таджикистан", "Тм": "Туркменистан",
+    "Фил": "Филиппины", "Индо": "Индонезия", "Сг": "Сингапур",
+    "Мал": "Малайзия", "Тай": "Таиланд", "Мья": "Мьянма",
+    "Инд": "Индия", "Бд": "Бангладеш", "Пак": "Пакистан",
+    "Неп": "Непал", "Шл": "Шри-Ланка", "Яп": "Япония",
+    "Кор": "Южная Корея", "Тайв": "Тайвань", "MENA": "Ближний Восток",
+    "Афр": "Африка", "NA": "Северная Америка",
+    "LATAM": "Латинская Америка", "Бра": "Бразилия", "Авст": "Австралия",
+}
+
+def _server_tag_options_text():
+    options = [tag[:-5] for tag in SERVER_TAGS if tag.endswith(" серв") and "/" not in tag and tag != "Унив серв"]
+    return "\n".join(
+        f"• <code>{code}</code> — {SERVER_DISPLAY_NAMES.get(code, code)}"
+        for code in options
+    )
+
 async def _ask_server_tag(chat_id: int, user):
     if not _server_tags_enabled():
         return
@@ -310,7 +333,10 @@ async def _ask_server_tag(chat_id: int, user):
     msg = await bot.send_message(
         chat_id,
         f"🏷 {mention}, напиши свой сервер <b>ответом на это сообщение</b>.\n\n"
-        "Например: <code>Мск</code>, <code>Ру</code>, <code>Ру/Еу</code>.\n"
+        "🌍 <b>Доступные серверы и регионы:</b>\n"
+        f"{_server_tag_options_text()}\n\n"
+        "✍️ Напиши сокращение из списка, например: <code>Мск</code> или <code>Ру/Еу</code>.\n"
+        "Можно указать 2–3 сервера через / или запятую.\n"
         "Если серверов больше 3 — будет выдан тег <b>Унив серв</b>.\n\n"
         "🚫 Если у тебя спам-блок и ты не можешь написать сообщение — поставь <b>любую реакцию</b> на это сообщение.\n"
         "Бот примет реакцию только от пользователя, к которому обратился.\n\n"
@@ -1153,6 +1179,34 @@ class ChatSummaryCollectorMiddleware(BaseMiddleware):
         return await handler(event, middleware_data)
 
 dp.message.outer_middleware(ChatSummaryCollectorMiddleware())
+
+# Мгновенные случайные реакции на каждое сообщение основного чата.
+# Отправляем асинхронно, чтобы запрос Telegram не задерживал обработчики.
+from aiogram.types import ReactionTypeEmoji
+
+AUTO_REACTION_EMOJIS = ("❤️", "🔥", "😂", "👍", "🥰", "🎉")
+
+async def _send_instant_reaction(chat_id: int, message_id: int):
+    try:
+        await bot.set_message_reaction(
+            chat_id=chat_id,
+            message_id=message_id,
+            reaction=[ReactionTypeEmoji(emoji=random.choice(AUTO_REACTION_EMOJIS))],
+        )
+    except Exception as exc:
+        print(f"[AUTO REACTION] {chat_id}/{message_id}: {exc}")
+
+class InstantReactionMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, middleware_data):
+        if (isinstance(event, Message) and event.chat.id == CHAT_ID
+                and event.from_user and not event.from_user.is_bot):
+            asyncio.create_task(_send_instant_reaction(event.chat.id, event.message_id))
+        return await handler(event, middleware_data)
+
+# Внешний middleware срабатывает и для сообщений без подходящего обработчика.
+dp.message.outer_middleware(InstantReactionMiddleware())
+
+
 
 
 # Доступ к боту в ЛС разрешён только участникам группы Admin Staff.
