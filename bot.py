@@ -1185,16 +1185,46 @@ dp.message.outer_middleware(ChatSummaryCollectorMiddleware())
 from aiogram.types import ReactionTypeEmoji
 
 AUTO_REACTION_EMOJIS = ("❤️", "🔥", "😂", "👍", "🥰", "🎉")
+# Telegram accepts only reactions enabled in the group. Cache the current list.
+_reaction_cache = {}  # chat_id -> (timestamp, tuple of emoji)
+_reaction_cache_ttl = 300
+
+async def _allowed_reactions(chat_id: int, force_refresh: bool = False):
+    now = asyncio.get_running_loop().time()
+    cached = _reaction_cache.get(chat_id)
+    if cached and not force_refresh and now - cached[0] < _reaction_cache_ttl:
+        return cached[1]
+    try:
+        chat = await bot.get_chat(chat_id)
+        available = getattr(chat, "available_reactions", None)
+        if available is None:
+            # None means the chat uses Telegram's default set.
+            emojis = AUTO_REACTION_EMOJIS
+        else:
+            emojis = tuple(r.emoji for r in available if isinstance(r, ReactionTypeEmoji))
+        _reaction_cache[chat_id] = (now, emojis)
+        return emojis
+    except Exception as exc:
+        print(f"[AUTO REACTION CONFIG] {chat_id}: {exc}")
+        return cached[1] if cached else ("👍", "❤️")
 
 async def _send_instant_reaction(chat_id: int, message_id: int):
+    emojis = await _allowed_reactions(chat_id)
+    if not emojis:
+        return  # Reactions are disabled or only paid/custom reactions are allowed.
     try:
         await bot.set_message_reaction(
             chat_id=chat_id,
             message_id=message_id,
-            reaction=[ReactionTypeEmoji(emoji=random.choice(AUTO_REACTION_EMOJIS))],
+            reaction=[ReactionTypeEmoji(emoji=random.choice(emojis))],
         )
     except Exception as exc:
-        print(f"[AUTO REACTION] {chat_id}/{message_id}: {exc}")
+        if "REACTION_INVALID" in str(exc).upper():
+            # Admins may have changed the chat's allowed reactions.
+            # Refresh for the next message; do not spam invalid retries.
+            _reaction_cache.pop(chat_id, None)
+        else:
+            print(f"[AUTO REACTION] {chat_id}/{message_id}: {exc}")
 
 class InstantReactionMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, middleware_data):
