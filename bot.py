@@ -1208,7 +1208,26 @@ async def _allowed_reactions(chat_id: int, force_refresh: bool = False):
         print(f"[AUTO REACTION CONFIG] {chat_id}: {exc}")
         return cached[1] if cached else ("👍", "❤️")
 
+# Shared site setting, refreshed frequently without restarting the bot.
+_reaction_setting_cache = (0.0, True)
+def _auto_reactions_enabled():
+    global _reaction_setting_cache
+    now = asyncio.get_running_loop().time()
+    if now - _reaction_setting_cache[0] < 2:
+        return _reaction_setting_cache[1]
+    enabled = _reaction_setting_cache[1]
+    try:
+        from db_storage import get_setting
+        value = get_setting('auto_reactions_enabled', True)
+        enabled = value is not False and str(value).lower() not in ('false', '0', 'off')
+    except Exception as exc:
+        print(f'[AUTO REACTION SETTING] {exc}')
+    _reaction_setting_cache = (now, enabled)
+    return enabled
+
 async def _send_instant_reaction(chat_id: int, message_id: int):
+    if not _auto_reactions_enabled():
+        return
     emojis = await _allowed_reactions(chat_id)
     if not emojis:
         return  # Reactions are disabled or only paid/custom reactions are allowed.
