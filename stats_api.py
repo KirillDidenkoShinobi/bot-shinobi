@@ -1,0 +1,984 @@
+import base64
+import hashlib
+import hmac
+import json
+import os
+import shutil
+import secrets
+import time
+import io
+import zipfile
+from datetime import datetime, timedelta
+from pathlib import Path
+from aiohttp import web
+import aiohttp
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill
+from chat_summary import snapshot as chat_summary_snapshot, uptime_seconds
+
+BASE_DIR = Path(__file__).resolve().parent
+REPORTS_DIR = BASE_DIR / "stats_reports"
+REPORTS_DIR.mkdir(exist_ok=True)
+SOURCE_FILES = [
+    "shinobi_links_log.xlsx",
+    "work_schedules.xlsx",
+    "day_off_requests.xlsx",
+    "data.json",
+    "admin_assignments.json",
+    "user_timezones.json",
+    "project_settings.json",
+    "shinobi_server_tags.txt",
+    "changelog.json",
+]
+ADVERTISING_LINK = "https://t.me/+xXGHYqokIiMzNjYy"
+MEDIA_DIR = BASE_DIR / "site_media"
+MEDIA_DIR.mkdir(exist_ok=True)
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+
+
+
+def _build_staff_schedule_xlsx(dst: Path):
+    """Build website staff schedule from admin duties only; no work-hour columns."""
+    try:
+        assignments = json.loads((BASE_DIR / "admin_assignments.json").read_text(encoding="utf-8"))
+    except Exception:
+        assignments = {}
+    try:
+        users = json.loads((BASE_DIR / "data.json").read_text(encoding="utf-8")).get("users", {})
+    except Exception:
+        users = {}
+
+    weekdays = [("Monday","Понедельник"),("Tuesday","Вторник"),("Wednesday","Среда"),("Thursday","Четверг"),("Friday","Пятница"),("Saturday","Суббота"),("Sunday","Воскресенье")]
+    duty_names = {"search":"Искать людей", "chat":"Следить за чатом", "tags":"Выдавать теги", "owner_tech":"Владелец / Тех админ"}
+    wb = Workbook(); ws = wb.active; ws.title = "График сотрудников"
+    headers = ["Сотрудник", "День", "Обязанность"]
+    for c, value in enumerate(headers, 1):
+        cell=ws.cell(1,c,value); cell.font=Font(bold=True,color="FFFFFF"); cell.fill=PatternFill("solid",fgColor="1F4E79"); cell.alignment=Alignment(horizontal="center")
+    row=2
+    for uid, week in assignments.items():
+        u = users.get(str(uid), {})
+        name = u.get("name") or u.get("username") or str(uid)
+        if u.get("username") and u.get("name"):
+            name += f" (@{u['username']})"
+        for day_en, day_ru in weekdays:
+            rec = (week or {}).get(day_en, {}) or {}
+            if rec.get("off"):
+                duty = "Выходной"
+            elif rec.get("always"):
+                duty = "Владелец / Тех админ"
+            else:
+                duty = ", ".join(duty_names.get(x,x) for x in rec.get("duties", [])) or "Без обязанностей"
+            ws.cell(row,1,name); ws.cell(row,2,day_ru); ws.cell(row,3,duty)
+            for c in range(1,4): ws.cell(row,c).alignment=Alignment(vertical="top",wrap_text=True)
+            row += 1
+    ws.column_dimensions["A"].width=30; ws.column_dimensions["B"].width=18; ws.column_dimensions["C"].width=55
+    ws.freeze_panes="A2"
+    wb.save(dst)
+
+def _manifest_path(report_id):
+    return REPORTS_DIR / report_id / "manifest.json"
+
+
+def create_report_snapshot(requested_by=None):
+    now = datetime.now()
+    report_id = now.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
+    folder = REPORTS_DIR / report_id
+    folder.mkdir(parents=True, exist_ok=False)
+    files = []
+    for name in SOURCE_FILES:
+        src = BASE_DIR / name
+        if name == "work_schedules.xlsx":
+            _build_staff_schedule_xlsx(folder / name)
+            files.append(name)
+        elif src.exists():
+            shutil.copy2(src, folder / name)
+            files.append(name)
+
+    # Отдельный сводный снимок нужен сайту: рекламная ссылка всегда отображается
+    # отдельным блоком и хранит значение именно на момент создания отчёта.
+    bot_data = {}
+    data_path = BASE_DIR / "data.json"
+    if data_path.exists():
+        try:
+            bot_data = json.loads(data_path.read_text(encoding="utf-8"))
+        except Exception:
+            bot_data = {}
+    ad_link = bot_data.get("advertising_link") or ADVERTISING_LINK
+    ad_info = bot_data.get("links", {}).get(ad_link, {})
+    all_links = bot_data.get("links", {})
+    users = bot_data.get("users", {})
+    overview = {
+        "advertising": {
+            "label": "Рекламная ссылка",
+            "link": ad_link,
+            "invited": int(ad_info.get("invited", 0) or 0),
+            "tracked_users": len(ad_info.get("users", []) or []),
+        },
+        "totals": {
+            "users": len(users),
+            "links": len(all_links),
+            "referral_links": sum(1 for x in all_links.values() if x.get("type") != "advertising"),
+            "invited": sum(int(x.get("invited", 0) or 0) for x in all_links.values()),
+            "manual_adjustments": len(bot_data.get("invite_adjustments", []) or []),
+        },
+        "links": [
+            {
+                "link": link,
+                "type": info.get("type", "referral"),
+                "label": info.get("label", ""),
+                "owner_id": info.get("owner_id"),
+                "invited": int(info.get("invited", 0) or 0),
+                "created": info.get("created", ""),
+                "join_request": bool(info.get("join_request")),
+            }
+            for link, info in all_links.items()
+        ],
+    }
+    (folder / "overview.json").write_text(json.dumps(overview, ensure_ascii=False, indent=2), encoding="utf-8")
+    files.insert(0, "overview.json")
+
+    manifest = {"id": report_id, "created_at": now.isoformat(timespec="seconds"), "requested_by": requested_by, "files": files}
+    _manifest_path(report_id).write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # Не ждём фонового цикла: новый отчёт сразу зеркалируется в PostgreSQL.
+    try:
+        from db_storage import sync_to_db
+        sync_to_db()
+    except Exception as exc:
+        print(f"[DB] Не удалось немедленно сохранить отчёт: {exc}")
+    return manifest
+
+
+def list_reports():
+    reports = []
+    for folder in REPORTS_DIR.iterdir():
+        if not folder.is_dir():
+            continue
+        mp = folder / "manifest.json"
+        if mp.exists():
+            try:
+                reports.append(json.loads(mp.read_text(encoding="utf-8")))
+            except Exception:
+                pass
+    return sorted(reports, key=lambda x: x.get("created_at", ""), reverse=True)
+
+
+def _api_authorized(request):
+    expected = os.getenv("SHINOBI_STATS_API_KEY", "").strip()
+    if not expected:
+        return False
+    supplied = request.headers.get("X-Shinobi-Key", "") or request.query.get("key", "")
+    return bool(supplied) and secrets.compare_digest(expected, supplied)
+
+
+def _session_secret():
+    return os.getenv("SESSION_SECRET", os.getenv("SHINOBI_STATS_API_KEY", "change-me-session-secret")).encode()
+
+
+def _make_session(role):
+    payload = json.dumps({"role": role, "exp": int(time.time()) + 60 * 60 * 24 * 7}, separators=(",", ":")).encode()
+    encoded = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+    sig = hmac.new(_session_secret(), encoded.encode(), hashlib.sha256).hexdigest()
+    return encoded + "." + sig
+
+
+def _read_session(request):
+    token = request.cookies.get("shinobi_session", "")
+    if "." not in token:
+        return None
+    encoded, sig = token.rsplit(".", 1)
+    good = hmac.new(_session_secret(), encoded.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, good):
+        return None
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+        if int(payload.get("exp", 0)) < int(time.time()):
+            return None
+        if payload.get("role") not in ("owner", "tech"):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+@web.middleware
+async def auth_middleware(request, handler):
+    public = {"/", "/login", "/api/status", "/media/banner", "/media/favicon"}
+    if request.path in public:
+        return await handler(request)
+    if request.path.startswith("/api/"):
+        if _api_authorized(request) or _read_session(request):
+            return await handler(request)
+        return web.json_response({"error": "forbidden"}, status=403)
+    if not _read_session(request):
+        raise web.HTTPFound("/")
+    return await handler(request)
+
+
+SETTINGS_FILE = BASE_DIR / "project_settings.json"
+DEFAULT_SETTINGS = {
+    "bot_version": "v1.0.0",
+    "project_name": "Shinobi Team",
+    "bot_name": "Shinobi Bot",
+    "environment": "PRODUCTION",
+    "platform": "MLBB",
+}
+
+def _load_settings():
+    data = dict(DEFAULT_SETTINGS)
+    try:
+        if SETTINGS_FILE.exists():
+            loaded = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data.update({k: v for k, v in loaded.items() if isinstance(v, (str, int, float, bool))})
+    except Exception as exc:
+        print(f"[SETTINGS] Ошибка чтения: {exc}")
+    # Платформа проекта фиксирована как MLBB. Это также перекрывает старое
+    # значение Railway, которое могло восстановиться из PostgreSQL.
+    data["platform"] = "MLBB"
+    return data
+
+def _save_settings(data):
+    SETTINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        from db_storage import sync_to_db
+        sync_to_db()
+    except Exception as exc:
+        print(f"[DB] Не удалось сохранить настройки: {exc}")
+
+async def status(request):
+    st = _load_settings()
+    return web.json_response({"ok": True, "service": "Shinobi Stats", "version": st.get("bot_version", "v1.0.0")})
+
+async def system_info(request):
+    st = _load_settings()
+    db_connected = bool(os.getenv("DATABASE_URL", "").strip())
+    return web.json_response({
+        "settings": st,
+        "database": "PostgreSQL" if db_connected else "Not configured",
+        "database_connected": db_connected,
+        "bot_status": "ONLINE",
+        "role": (_read_session(request) or {}).get("role", ""),
+    }, dumps=lambda x: json.dumps(x, ensure_ascii=False))
+
+async def update_version(request):
+    session = _read_session(request)
+    if not session or session.get("role") != "tech":
+        return web.json_response({"error": "tech_only"}, status=403)
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid_json"}, status=400)
+    version = str(payload.get("version", "")).strip()
+    if not version or len(version) > 64:
+        return web.json_response({"error": "invalid_version"}, status=400)
+    st = _load_settings()
+    st["bot_version"] = version
+    st["version_updated_at"] = datetime.now().isoformat(timespec="seconds")
+    _save_settings(st)
+    return web.json_response({"ok": True, "version": version}, dumps=lambda x: json.dumps(x, ensure_ascii=False))
+
+
+def _detect_image_ext(blob):
+    if blob.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if blob.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if blob.startswith(b"RIFF") and blob[8:12] == b"WEBP":
+        return ".webp"
+    return None
+
+def _media_file(kind):
+    for ext in (".png", ".jpg", ".webp"):
+        p = MEDIA_DIR / (kind + ext)
+        if p.exists():
+            return p
+    return None
+
+def _sync_media():
+    try:
+        from db_storage import sync_to_db
+        sync_to_db()
+    except Exception as exc:
+        print(f"[DB] Не удалось сохранить оформление: {exc}")
+
+async def media_file(request):
+    kind = request.match_info["kind"]
+    if kind not in ("banner", "favicon"):
+        raise web.HTTPNotFound()
+    p = _media_file(kind)
+    if not p:
+        raise web.HTTPNotFound()
+    return web.FileResponse(p)
+
+async def upload_media(request):
+    session = _read_session(request)
+    if not session or session.get("role") != "tech":
+        return web.json_response({"error": "tech_only"}, status=403)
+    kind = request.match_info["kind"]
+    if kind not in ("banner", "favicon"):
+        return web.json_response({"error": "invalid_kind"}, status=400)
+    try:
+        reader = await request.multipart()
+        field = await reader.next()
+        if not field or field.name != "image":
+            return web.json_response({"error": "image_required"}, status=400)
+        chunks, total = [], 0
+        while True:
+            chunk = await field.read_chunk()
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_IMAGE_BYTES:
+                return web.json_response({"error": "too_large"}, status=413)
+            chunks.append(chunk)
+        blob = b"".join(chunks)
+        ext = _detect_image_ext(blob)
+        if not ext:
+            return web.json_response({"error": "unsupported_image"}, status=415)
+        for old_ext in (".png", ".jpg", ".webp"):
+            old = MEDIA_DIR / (kind + old_ext)
+            if old.exists():
+                old.unlink()
+        dst = MEDIA_DIR / (kind + ext)
+        dst.write_bytes(blob)
+        _sync_media()
+        return web.json_response({"ok": True, "url": f"/media/{kind}?v={int(time.time())}"})
+    except Exception as exc:
+        print(f"[MEDIA] Ошибка загрузки: {exc}")
+        return web.json_response({"error": "upload_failed"}, status=500)
+
+
+
+OCTOBER_PLAN_FILE = BASE_DIR / "october_content_plan.json"
+
+def _read_october_plan():
+    try:
+        return json.loads(OCTOBER_PLAN_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {"month":"2026-10","items":[]}
+
+def _write_october_plan(data):
+    tmp = BASE_DIR / "october_content_plan.web.tmp"
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(OCTOBER_PLAN_FILE)
+
+async def october_plan_api(request):
+    session = _read_session(request)
+    if not session or session.get("role") != "tech":
+        return web.json_response({"error":"tech_only"}, status=403)
+    return web.json_response(_read_october_plan(), dumps=lambda x: json.dumps(x, ensure_ascii=False))
+
+async def october_plan_update(request):
+    session = _read_session(request)
+    if not session or session.get("role") != "tech":
+        return web.json_response({"error":"tech_only"}, status=403)
+    try:
+        payload = await request.json(); date = str(payload.get("date", "")); done = bool(payload.get("done"))
+    except Exception:
+        return web.json_response({"error":"invalid_data"}, status=400)
+    data = _read_october_plan(); found = False
+    for item in data.get("items", []):
+        if item.get("date") == date:
+            item["done"] = done; found = True; break
+    if not found: return web.json_response({"error":"not_found"}, status=404)
+    _write_october_plan(data)
+    return web.json_response({"ok":True,"date":date,"done":done})
+
+LOGIN_HTML = r'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Shinobi Stats • Authorization</title><link rel="icon" href="/media/favicon"><style>
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 50% 0,#300006 0,#0b0b0c 38%,#050506 100%);font-family:Arial,sans-serif;color:#fff;display:grid;place-items:center}.card{width:min(440px,92vw);background:rgba(17,17,19,.94);border:1px solid #2b2b2f;border-radius:22px;padding:34px;box-shadow:0 30px 90px #000,0 0 60px #e5091422}.mark{width:64px;height:64px;border-radius:18px;background:linear-gradient(145deg,#ff1824,#8e0008);display:grid;place-items:center;font-weight:900;font-size:28px;margin:0 auto 18px;box-shadow:0 0 35px #e5091444}h1{text-align:center;margin:0;font-size:28px}.sub{text-align:center;color:#777;margin:8px 0 28px;font-size:12px;letter-spacing:1.5px}.roles{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:18px}.role{border:1px solid #303035;background:#171719;color:#aaa;padding:13px;border-radius:11px;cursor:pointer}.role.active{border-color:#e50914;color:#fff;background:#e5091418}.label{font-size:12px;color:#888;margin:0 0 7px 2px}input{width:100%;background:#0d0d0f;border:1px solid #303035;color:#fff;padding:14px;border-radius:10px;outline:none;font-size:15px}input:focus{border-color:#e50914}.btn{width:100%;border:0;border-radius:10px;padding:14px;margin-top:15px;background:linear-gradient(135deg,#ef101b,#a9050d);color:#fff;font-weight:800;cursor:pointer}.err{background:#e5091415;border:1px solid #e5091444;color:#ff6870;padding:10px;border-radius:9px;margin-bottom:15px;font-size:13px}.foot{text-align:center;color:#444;font-size:11px;margin-top:22px}</style></head><body><form class="card" method="post" action="/login"><div class="mark">S</div><h1>SHINOBI <span style="color:#e50914">STATS</span></h1><div class="sub">INTERNAL ACCESS • AUTHORIZATION</div>__ERROR__<div class="roles"><button type="button" class="role active" data-role="owner">👑 Владелец</button><button type="button" class="role" data-role="tech">🛠 Тех. админ</button></div><input type="hidden" name="role" id="role" value="owner"><div class="label">ПАРОЛЬ ДОСТУПА</div><input type="password" name="password" placeholder="Введите пароль" autocomplete="current-password" required><button class="btn">ВОЙТИ В СИСТЕМУ</button><div class="foot">SHINOBI TEAM © 2026 • PROTECTED SYSTEM</div></form><script>document.querySelectorAll('.role').forEach(b=>b.onclick=()=>{document.querySelectorAll('.role').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.getElementById('role').value=b.dataset.role})</script></body></html>'''
+
+
+DASHBOARD_HTML = r'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Shinobi Stats</title><link rel="icon" href="/media/favicon"><script src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"></script><script src="https://cdn.jsdelivr.net/npm/chart.js"></script><style>
+*{box-sizing:border-box}body{margin:0;background:#070708;color:#eee;font-family:Arial,sans-serif}header{height:72px;padding:0 28px;display:flex;align-items:center;justify-content:space-between;background:#101012;border-bottom:1px solid #29292d;position:sticky;top:0;z-index:10}.brand{font-weight:900;font-size:21px}.brand span{color:#e50914}.who{font-size:12px;color:#999}.who b{color:#ff3942}.logout{color:#aaa;text-decoration:none;border:1px solid #333;padding:8px 11px;border-radius:8px;margin-left:12px}main{max-width:1450px;margin:auto;padding:30px 22px}.eyebrow{color:#e50914;font-size:11px;letter-spacing:2px;font-weight:bold}.title{font-size:32px;margin:7px 0 5px}.muted{color:#666}.toolbar{display:flex;gap:12px;align-items:center;margin:25px 0}.btn{border:0;background:#d70812;color:#fff;padding:11px 16px;border-radius:8px;font-weight:700;cursor:pointer}.grid{display:grid;grid-template-columns:300px 1fr;gap:18px}.panel{background:#101012;border:1px solid #252529;border-radius:14px;overflow:hidden}.ph{padding:15px 17px;border-bottom:1px solid #252529;font-weight:700}.reports{max-height:650px;overflow:auto}.report{padding:14px 16px;border-bottom:1px solid #1f1f22;cursor:pointer}.report:hover,.report.active{background:#e5091410;border-left:3px solid #e50914}.rid{font-size:12px;font-weight:bold}.rdate{font-size:11px;color:#666;margin-top:5px}.content{min-height:500px}.tabs{display:flex;gap:7px;padding:12px;border-bottom:1px solid #252529;overflow:auto}.tab{background:#17171a;color:#aaa;border:1px solid #2c2c31;border-radius:8px;padding:9px 12px;cursor:pointer;white-space:nowrap}.tab.active{background:#e50914;color:white;border-color:#e50914}.tablewrap{overflow:auto;max-height:650px}table{border-collapse:collapse;width:100%;min-width:720px;font-size:13px}td,th{padding:11px 14px;border-bottom:1px solid #242428;border-right:1px solid #202024;white-space:nowrap;text-align:left}th{background:#a8070e;color:white;position:sticky;top:0}tr:hover td{background:#17171a}.empty{padding:70px 20px;text-align:center;color:#666}.status{font-size:12px;color:#777}.topnav{display:flex;gap:8px;margin:20px 0}.navbtn{background:#151517;border:1px solid #2b2b30;color:#aaa;padding:10px 14px;border-radius:9px;cursor:pointer;font-weight:700}.navbtn.active{background:#e50914;color:#fff;border-color:#e50914}.infoGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}.infoCard{background:#101012;border:1px solid #29292e;border-radius:14px;padding:18px}.infoLabel{font-size:11px;color:#777;letter-spacing:1px}.infoValue{font-size:22px;font-weight:900;margin-top:8px}.hero{background:linear-gradient(0deg,rgba(5,5,6,.70),rgba(5,5,6,.22)),url('/media/banner') center/cover no-repeat,linear-gradient(135deg,#24080b,#101012 55%,#190306);border:1px solid #4c1116;border-radius:18px;padding:28px;margin-bottom:18px;min-height:170px;display:flex;flex-direction:column;justify-content:flex-end}.hero h2{font-size:34px;margin:0 0 7px}.editrow{display:flex;gap:8px;margin-top:14px}.editrow input{flex:1;background:#0b0b0d;border:1px solid #333;color:#fff;border-radius:8px;padding:11px}.mediaTools{margin-top:18px;padding:16px;background:#101012;border:1px solid #29292e;border-radius:14px}.mediaTools h3{margin:0 0 10px}.mediaRow{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.mediaRow input[type=file]{max-width:320px;color:#aaa}.mediaPreview{width:100%;max-width:520px;max-height:180px;object-fit:cover;border-radius:12px;border:1px solid #333;margin-top:12px}.page{display:none}.page.active{display:block}@media(max-width:800px){header{padding:0 14px}.grid{grid-template-columns:1fr}.reports{max-height:230px}.title{font-size:26px}.who{font-size:0}.who b,.logout{font-size:11px}main{padding:22px 12px}}</style></head><body><header><div class="brand">SHINOBI <span>STATS</span></div><div class="who"><b>__ROLE__</b> • AUTHORIZED <a class="logout" href="/logout">Выйти</a></div></header><main><div class="eyebrow">SHINOBI TEAM • INTERNAL SYSTEM</div><div class="title">Контроль сотрудников</div><div class="muted">Отчёты и архив администрации проекта • BUILD 2026.09.27.2</div><div class="topnav"><button class="navbtn active" onclick="showPage('reportsPage',this)">📊 Отчёты</button><button class="navbtn" onclick="showPage('projectPage',this)">🥷 О проекте</button><button class="navbtn" onclick="showPage('botPage',this)">🤖 О боте</button><button class="navbtn" onclick="showPage('controlPage',this);loadControl()">🎛 Управление</button><button class="navbtn" onclick="showPage('changesPage',this);loadChanges()">🗓 История изменений</button><button class="navbtn" onclick="showPage('chatPage',this);loadChatSummary()">💬 Сводка чатов</button><button class="navbtn" onclick="showPage('growthPage',this);loadGrowth()">📈 Приглашения и рост</button>__TECH_NAV__<button class="navbtn" onclick="showPage('aiModPage',this);loadAiModeration()">🧪 AI-модерация <b>BETA</b></button></div><div id="aiModPage" class="page"><div class="hero"><div class="eyebrow">AI MODERATION • BETA</div><h2>🧪 Журнал модерации <span style="font-size:15px;border:1px solid #e50914;padding:4px 8px;border-radius:8px">BETA</span></h2><div class="muted">AI и ручные наказания Staff в единой системе Shinobi Moderation.</div></div><div class="infoGrid"><div class="infoCard"><div class="infoLabel">СРАБАТЫВАНИЙ В ЖУРНАЛЕ</div><div class="infoValue" id="aiModCount">—</div></div><div class="infoCard"><div class="infoLabel">СТАТУС</div><div class="infoValue">🧪 BETA</div></div></div><div class="mediaTools"><h3>🛡 Последние нарушения • BETA</h3><div class="status" style="margin-bottom:12px">Показываются последние 500 применённых решений AI-модерации.</div><div id="aiModLog"><div class="empty">Загрузка…</div></div></div></div><div id="growthPage" class="page"><div class="hero"><div class="eyebrow">SHINOBI ANALYTICS</div><h2>📈 Приглашения и рост чата</h2><div class="muted">Рейтинг реферальных ссылок, дневной прирост и история входов в основной чат.</div></div><div class="infoGrid"><div class="infoCard"><div class="infoLabel">ВОШЛО СЕГОДНЯ</div><div class="infoValue" id="joinsToday">—</div></div><div class="infoCard"><div class="infoLabel">ВОШЛО ВЧЕРА</div><div class="infoValue" id="joinsYesterday">—</div></div><div class="infoCard"><div class="infoLabel">ПРИРОСТ К ВЧЕРА</div><div class="infoValue" id="joinsDelta">—</div></div><div class="infoCard"><div class="infoLabel">ЗА 30 ДНЕЙ</div><div class="infoValue" id="joinsPeriod">—</div></div></div><div class="mediaTools"><h3>📊 График входов за 30 дней</h3><div style="height:340px"><canvas id="joinsChart"></canvas></div></div><div class="mediaTools"><h3>🏆 Ссылки по количеству приглашённых</h3><div class="status" style="margin-bottom:12px">Сортировка от большего к меньшему. Персональную ссылку можно удалить прямо здесь.</div><div id="referralRanking"><div class="empty">Загрузка…</div></div></div></div><div id="octoberPage" class="page"><div class="hero"><div class="eyebrow">TECH ADMIN • OCTOBER 2026</div><h2>📅 План на октябрь</h2><div class="muted">31 день контента MLBB. Отмечай выполненные публикации галочкой.</div></div><div class="panel"><div class="ph">Контент-план • Октябрь 2026</div><div id="octoberPlanBox"><div class="empty">Загрузка…</div></div></div></div><div id="reportsPage" class="page active"><div class="toolbar"><button class="btn" id="newReportBtn" onclick="createNewReport()">＋ Новый отчёт</button><button class="btn" onclick="loadReports()">↻ Обновить архив</button><span class="status" id="status">Готово</span></div><div class="grid"><section class="panel"><div class="ph">Архив отчётов</div><div class="reports" id="reports"><div class="empty">Загрузка…</div></div></section><section class="panel content"><div class="ph" id="reportTitle">Выберите отчёт</div><div class="tabs" id="tabs"></div><div class="tablewrap" id="table"><div class="empty">Выберите отчёт слева</div></div></section></div></div><div id="projectPage" class="page"><div class="hero"><div class="eyebrow">SHINOBI TEAM</div><h2>О проекте</h2><div class="muted">Внутренняя система управления, отчётности и контроля Shinobi Team.</div></div><div class="infoGrid"><div class="infoCard"><div class="infoLabel">ПРОЕКТ</div><div class="infoValue" id="projectName">Shinobi Team</div></div><div class="infoCard"><div class="infoLabel">ПЛАТФОРМА</div><div class="infoValue" id="platform">MLBB</div></div><div class="infoCard"><div class="infoLabel">СРЕДА</div><div class="infoValue" id="environment">PRODUCTION</div></div><div class="infoCard"><div class="infoLabel">БАЗА ДАННЫХ</div><div class="infoValue" id="database">—</div></div></div><div id="mediaEditor"></div></div><div id="botPage" class="page"><div class="hero"><div class="eyebrow">SHINOBI SYSTEM</div><h2>О боте</h2><div class="muted">Техническая информация о текущей версии Telegram-бота.</div></div><div class="infoGrid"><div class="infoCard"><div class="infoLabel">BOT STATUS</div><div class="infoValue" style="color:#43d17a" id="botStatus">● ONLINE</div></div><div class="infoCard"><div class="infoLabel">BOT VERSION</div><div class="infoValue" id="botVersion">—</div><div id="versionEditor"></div></div><div class="infoCard"><div class="infoLabel">DATABASE</div><div class="infoValue" id="botDatabase">—</div></div><div class="infoCard"><div class="infoLabel">ACCESS ROLE</div><div class="infoValue">__ROLE__</div></div></div></div><div id="controlPage" class="page"><div class="hero"><div class="eyebrow">TELEGRAM WEB APP</div><h2>Управление ботом</h2><div class="muted">Состояние Telegram-функций, группы, пользователи и серверные теги.</div></div><div class="infoGrid"><div class="infoCard"><div class="infoLabel">ПОЛЬЗОВАТЕЛЕЙ</div><div class="infoValue" id="ctlUsers">—</div></div><div class="infoCard"><div class="infoLabel">ГРУПП</div><div class="infoValue" id="ctlGroups">—</div></div><div class="infoCard"><div class="infoLabel">ВЫДАНО ТЕГОВ</div><div class="infoValue" id="ctlTags">—</div></div><div class="infoCard"><div class="infoLabel">ТЕХ. РАБОТЫ</div><div class="infoValue" id="ctlMaint">—</div></div></div><div class="mediaTools"><h3>⚡ Автовыдача серверных тегов</h3><div class="status">Если выключено, бот не спрашивает сервер у новых участников, не реагирует на ответы и реакции для выдачи тегов.</div><div class="mediaRow" style="margin-top:12px"><button class="btn" id="serverTagsToggle" onclick="toggleServerTags()">Загрузка…</button><span class="status" id="serverTagsState"></span></div></div><div class="mediaTools"><h3>🏷 Серверные теги</h3><div class="status">Ручная выдача использует Telegram setChatMemberTag. Боту нужно право can_manage_tags.</div><div class="mediaRow" style="margin-top:12px"><input id="tagChat" placeholder="Chat ID"><input id="tagUser" placeholder="User ID"><select id="tagValue" style="background:#0d0d0f;color:#fff;border:1px solid #333;padding:11px;border-radius:8px"></select><button class="btn" onclick="assignTagWeb()">Выдать тег</button></div><div class="status" id="tagStatus" style="margin-top:10px">Готово</div><div id="tagHistory" style="margin-top:14px;overflow:auto"></div></div><div class="mediaTools"><h3>👤 Участники без тега</h3><div class="status">Проверяет участников ОСНОВНОГО чата, которых бот уже знает. Администраторы исключаются автоматически — их специальные теги не учитываются. Telegram Bot API не отдаёт боту полный список всех участников группы.</div><div class="mediaRow" style="margin-top:12px"><button class="btn" onclick="loadUntagged()">Обновить список</button><button class="navbtn" onclick="copyUntagged()">Копировать</button><span class="status" id="untaggedStatus">Нажмите «Обновить список»</span></div><textarea id="untaggedList" readonly style="width:100%;min-height:180px;margin-top:12px;background:#0b0b0d;color:#eee;border:1px solid #333;border-radius:8px;padding:12px;resize:vertical"></textarea></div><div class="mediaTools"><h3>💾 Полный бэкап бота</h3><div class="status">Собирает ZIP в момент запроса: актуальные файлы бота, локальные данные, отчёты, медиа и полный экспорт PostgreSQL. Для скачивания требуется отдельный резервный код.</div><div class="mediaRow" style="margin-top:12px"><button class="btn" id="backupBtn" onclick="downloadFullBackup()">Скачать актуальную версию</button><span class="status" id="backupStatus">Готово</span></div></div><div class="mediaTools" id="marketWalletPanel"><h3>💎 Монеты Чёрного рынка</h3><div class="status">Доступно владельцу и тех. админу. Выбери игрока и добавь ему виртуальные монеты либо установи точный баланс.</div><div class="mediaRow" style="margin-top:12px"><select id="marketPlayer" style="min-width:320px;background:#0d0d0f;color:#fff;border:1px solid #333;padding:11px;border-radius:8px"></select><input id="marketAmount" type="number" min="0" placeholder="Количество монет"><select id="marketMode" style="background:#0d0d0f;color:#fff;border:1px solid #333;padding:11px;border-radius:8px"><option value="add">Добавить к балансу</option><option value="set">Установить баланс</option></select><button class="btn" onclick="updateMarketWallet()">Применить</button></div><div class="status" id="marketWalletStatus" style="margin-top:10px">Загрузка игроков…</div></div><div class="mediaTools"><h3>🏘 Группы и доступ к командам</h3><div class="status" style="margin-bottom:10px">Переключатель действует на все команды бота, включая игровые. Новые группы по умолчанию получают доступ.</div><div id="ctlGroupList" class="status">Загрузка…</div></div><div class="mediaTools"><h3>👥 Пользователи бота</h3><div id="ctlUserList" class="status">Загрузка…</div></div></div><div id="changesPage" class="page"><div class="hero"><div class="eyebrow">SHINOBI CHANGELOG</div><h2>История изменений</h2><div class="muted">Что менялось в боте и веб-панели — по датам.</div></div><div id="changesList"><div class="empty">Загрузка…</div></div></div><div id="chatPage" class="page"><div class="hero"><div class="eyebrow">LIVE CHAT ANALYTICS</div><h2>Сводка чатов</h2><div class="muted">Статистика собирается ботом отдельно для каждого установленного чата.</div></div><div id="chatSummaryBox" class="infoGrid"><div class="empty">Загрузка…</div></div><div class="status" style="margin-top:14px">🟢 «Активны» = уникальные пользователи, от которых бот видел сообщения за последние 15 минут. Telegram Bot API не предоставляет точный список online-пользователей группы.</div></div></main><script>
+let reports=[],current=null;const labels={'overview.json':'Обзор','shinobi_links_log.xlsx':'Результаты и приглашения','work_schedules.xlsx':'График сотрудников','day_off_requests.xlsx':'Заявки на выходные','data.json':'Полная база бота','admin_assignments.json':'Данные обязанностей','user_timezones.json':'Часовые пояса'};
+let sysInfo=null;function showPage(id,btn){document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));document.getElementById(id).classList.add('active');document.querySelectorAll('.navbtn').forEach(x=>x.classList.remove('active'));btn.classList.add('active');if(id!=='reportsPage')loadSystemInfo()}
+async function loadSystemInfo(){let r=await fetch('/api/system-info');if(!r.ok)return;sysInfo=await r.json();let s=sysInfo.settings||{};document.getElementById('projectName').textContent=s.project_name||'Shinobi Team';document.getElementById('platform').textContent=s.platform||'MLBB';document.getElementById('environment').textContent=s.environment||'PRODUCTION';document.getElementById('database').textContent=sysInfo.database_connected?'● PostgreSQL Connected':'Not configured';document.getElementById('botStatus').textContent='● '+(sysInfo.bot_status||'ONLINE');document.getElementById('botVersion').textContent=s.bot_version||'v1.0.0';document.getElementById('botDatabase').textContent=sysInfo.database||'—';let e=document.getElementById('versionEditor');e.innerHTML=sysInfo.role==='tech'?`<div class="editrow"><input id="newVersion" maxlength="64" value="${escapeHtml(s.bot_version||'v1.0.0')}" placeholder="Например v1920.20wsW"><button class="btn" onclick="saveVersion()">Сохранить</button></div><div class="status" id="versionStatus" style="margin-top:8px">Версию может менять только тех. администратор.</div>`:'<div class="status" style="margin-top:10px">Изменение доступно только тех. администратору.</div>';renderMediaEditor(sysInfo.role)}
+async function saveVersion(){let v=document.getElementById('newVersion').value.trim(),st=document.getElementById('versionStatus');if(!v){st.textContent='Введите версию';return}let r=await fetch('/api/system/version',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version:v})});let j=await r.json();if(!r.ok){st.textContent='Ошибка сохранения';return}st.textContent='✓ Версия сохранена в PostgreSQL';document.getElementById('botVersion').textContent=j.version;loadSystemInfo()}
+function renderMediaEditor(role){let e=document.getElementById('mediaEditor');if(!e)return;if(role!=='tech'){e.innerHTML='<div class="mediaTools"><h3>🎨 Оформление проекта</h3><div class="status">Изменение баннера и иконки доступно только тех. администратору.</div></div>';return}e.innerHTML=`<div class="mediaTools"><h3>🎨 Оформление проекта</h3><div class="status" style="margin-bottom:12px">PNG / JPG / WEBP, до 8 МБ. Изображения сохраняются в PostgreSQL.</div><div class="mediaRow"><input id="bannerFile" type="file" accept="image/png,image/jpeg,image/webp"><button class="btn" onclick="uploadMedia('banner','bannerFile','mediaStatus')">Загрузить баннер</button><input id="faviconFile" type="file" accept="image/png,image/jpeg,image/webp"><button class="btn" onclick="uploadMedia('favicon','faviconFile','mediaStatus')">Загрузить иконку</button></div><div class="status" id="mediaStatus" style="margin-top:10px">Готово</div><img class="mediaPreview" src="/media/banner?ts=${Date.now()}" onerror="this.style.display='none'" alt="Баннер"></div>`}
+async function uploadMedia(kind,inputId,statusId){let input=document.getElementById(inputId),st=document.getElementById(statusId);if(!input||!input.files||!input.files[0]){st.textContent='Сначала выберите изображение';return}let fd=new FormData();fd.append('image',input.files[0]);st.textContent='Загрузка…';let r=await fetch('/api/media/'+kind,{method:'POST',body:fd});let j={};try{j=await r.json()}catch(e){}if(!r.ok){st.textContent='Ошибка загрузки: '+(j.error||r.status);return}st.textContent='✓ Изображение сохранено';if(kind==='favicon'){let link=document.querySelector('link[rel="icon"]');if(link)link.href='/media/favicon?ts='+Date.now()}else{document.querySelectorAll('.hero').forEach(x=>x.style.backgroundImage=`linear-gradient(0deg,rgba(5,5,6,.70),rgba(5,5,6,.22)),url('/media/banner?ts=${Date.now()}')`);let img=document.querySelector('.mediaPreview');if(img){img.style.display='block';img.src='/media/banner?ts='+Date.now()}}}
+async function createNewReport(){let btn=document.getElementById('newReportBtn');btn.disabled=true;status.textContent='Формирование нового отчёта…';try{let r=await fetch('/api/reports',{method:'POST'});let j={};try{j=await r.json()}catch(e){}if(!r.ok){status.textContent='Ошибка создания: '+(j.error||r.status);return}current=j.report.id;await loadReports();openReport(j.report.id);status.textContent='✓ Новый отчёт создан: '+j.report.id}catch(e){status.textContent='Ошибка соединения при создании отчёта'}finally{btn.disabled=false}}
+async function loadReports(){status.textContent='Обновление…';let r=await fetch('/api/reports');if(!r.ok){status.textContent='Ошибка доступа';return}let j=await r.json();reports=j.reports||[];renderReports();status.textContent='Отчётов: '+reports.length;if(reports.length&&!current)openReport(reports[0].id)}
+function renderReports(){let el=document.getElementById('reports');if(!reports.length){el.innerHTML='<div class="empty">Архив пока пуст</div>';return}el.innerHTML=reports.map(x=>`<div class="report ${current===x.id?'active':''}" onclick="openReport('${x.id}')"><div class="rid">REPORT ${x.id}</div><div class="rdate">${new Date(x.created_at).toLocaleString('ru-RU')}</div></div>`).join('')}
+function openReport(id){current=id;renderReports();let r=reports.find(x=>x.id===id);document.getElementById('reportTitle').textContent='Отчёт • '+new Date(r.created_at).toLocaleString('ru-RU');let files=r.files||[];document.getElementById('tabs').innerHTML=files.map((f,i)=>`<button class="tab ${i===0?'active':''}" onclick="openFile('${id}','${f}',this)">${labels[f]||f}</button>`).join('');if(files[0])openFile(id,files[0],document.querySelector('.tab'))}
+async function openFile(id,file,btn){document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));if(btn)btn.classList.add('active');let box=document.getElementById('table');box.innerHTML='<div class="empty">Загрузка данных…</div>';let r=await fetch('/api/reports/'+encodeURIComponent(id)+'/'+encodeURIComponent(file));if(!r.ok){box.innerHTML='<div class="empty">Не удалось загрузить данные</div>';return}if(file==='overview.json'){let j=await r.json();let a=j.advertising||{},t=j.totals||{};box.innerHTML=`<div style="padding:18px"><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-bottom:18px"><div style="padding:18px;background:#180b0d;border:1px solid #5b1117;border-radius:12px"><div style="color:#ff3942;font-size:12px;font-weight:800">📣 РЕКЛАМНАЯ ССЫЛКА</div><div style="font-size:32px;font-weight:900;margin:9px 0">${a.invited||0}</div><div style="color:#888;font-size:12px">приглашённых</div><div style="margin-top:12px;font-size:12px;word-break:break-all">${a.link||''}</div></div><div style="padding:18px;background:#151517;border:1px solid #2b2b30;border-radius:12px"><div style="color:#888;font-size:12px">ВСЕГО ССЫЛОК</div><div style="font-size:30px;font-weight:900;margin-top:9px">${t.links||0}</div></div><div style="padding:18px;background:#151517;border:1px solid #2b2b30;border-radius:12px"><div style="color:#888;font-size:12px">ВСЕГО ПРИГЛАШЕНО</div><div style="font-size:30px;font-weight:900;margin-top:9px">${t.invited||0}</div></div><div style="padding:18px;background:#151517;border:1px solid #2b2b30;border-radius:12px"><div style="color:#888;font-size:12px">ПОЛЬЗОВАТЕЛЕЙ</div><div style="font-size:30px;font-weight:900;margin-top:9px">${t.users||0}</div></div></div><h3>Все ссылки</h3><div style="overflow:auto"><table><tr><th>Тип</th><th>Ссылка</th><th>Приглашено</th><th>Создатель ID</th><th>Создана</th></tr>${(j.links||[]).map(x=>`<tr><td>${x.type==='advertising'?'📣 Рекламная':'Реферальная'}</td><td>${x.link||''}</td><td><b>${x.invited||0}</b></td><td>${x.owner_id??''}</td><td>${x.created||''}</td></tr>`).join('')}</table></div></div>`;return}if(file.endsWith('.json')){let j=await r.json();box.innerHTML='<pre style="padding:18px;white-space:pre-wrap;word-break:break-word;color:#bbb">'+escapeHtml(JSON.stringify(j,null,2))+'</pre>';return}let buf=await r.arrayBuffer();let wb=XLSX.read(buf,{type:'array'});let s=wb.Sheets[wb.SheetNames[0]];let html=XLSX.utils.sheet_to_html(s);box.innerHTML=html;let first=document.querySelector('#table table tr');if(first)first.querySelectorAll('td').forEach(td=>{let th=document.createElement('th');th.innerHTML=td.innerHTML;td.replaceWith(th)})}
+function escapeHtml(s){return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+
+let joinsChartInstance=null;
+async function loadGrowth(){
+ let [ar,jr]=await Promise.all([fetch('/api/referrals'),fetch('/api/joins-analytics?days=30')]);
+ if(jr.ok){let j=await jr.json();document.getElementById('joinsToday').textContent=j.today||0;document.getElementById('joinsYesterday').textContent=j.yesterday||0;let d=Number(j.delta||0);document.getElementById('joinsDelta').textContent=(d>0?'+':'')+d;document.getElementById('joinsPeriod').textContent=j.period_total||0;let ctx=document.getElementById('joinsChart');if(joinsChartInstance)joinsChartInstance.destroy();joinsChartInstance=new Chart(ctx,{type:'line',data:{labels:(j.series||[]).map(x=>x.date.slice(5).split('-').reverse().join('.')),datasets:[{label:'Входы',data:(j.series||[]).map(x=>x.joins),borderWidth:2,tension:.28,fill:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:'#aaa'}}},scales:{x:{ticks:{color:'#777'},grid:{color:'#1d1d20'}},y:{beginAtZero:true,ticks:{color:'#777',precision:0},grid:{color:'#1d1d20'}}}}});}
+ let box=document.getElementById('referralRanking');if(!ar.ok){box.innerHTML='<div class="empty">Ошибка загрузки ссылок</div>';return}let a=await ar.json(),rows=a.links||[];box.innerHTML='<div style="overflow:auto"><table><tr><th>#</th><th>Владелец</th><th>Ссылка</th><th>Приглашено</th><th>Действие</th></tr>'+rows.map((x,i)=>`<tr><td>${i+1}</td><td>${escapeHtml(x.username?'@'+x.username:(x.name||'Без имени'))}</td><td style="max-width:420px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(x.link||'')}</td><td><b>${x.invited||0}</b></td><td>${x.type==='advertising'?'<span class="status">Системная</span>':`<button class="navbtn" onclick='deleteReferral(${JSON.stringify(x.link)})'>Удалить</button>`}</td></tr>`).join('')+'</table></div>';
+}
+async function deleteReferral(link){if(!confirm('Удалить эту персональную ссылку? Она также будет отозвана в Telegram, если Bot API разрешит.'))return;let r=await fetch('/api/referrals/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({link})});let j={};try{j=await r.json()}catch(e){};if(!r.ok){alert('Ошибка: '+(j.error||r.status));return}loadGrowth()}
+
+async function loadControl(){let r=await fetch('/api/control');if(!r.ok)return;let j=await r.json();document.getElementById('ctlUsers').textContent=j.counts.users;document.getElementById('ctlGroups').textContent=j.counts.groups;document.getElementById('ctlTags').textContent=j.counts.tags;document.getElementById('ctlMaint').textContent=j.maintenance?'ВКЛ':'ВЫКЛ';let tg=!!j.server_tags_enabled;document.getElementById('serverTagsState').textContent=tg?'🟢 Функция включена':'🔴 Функция выключена';let tgb=document.getElementById('serverTagsToggle');tgb.textContent=tg?'Выключить выдачу тегов':'Включить выдачу тегов';tgb.dataset.enabled=tg?'1':'0';let sel=document.getElementById('tagValue');sel.innerHTML=(j.server_tags||[]).map(x=>`<option>${escapeHtml(x)}</option>`).join('');document.getElementById('tagHistory').innerHTML='<table><tr><th>Игрок</th><th>User ID</th><th>Тег</th><th>Дата</th></tr>'+Object.values(j.assignments||{}).slice(-50).reverse().map(x=>`<tr><td>${escapeHtml(x.name||'')}</td><td>${x.user_id||''}</td><td>${escapeHtml(x.tag||'')}</td><td>${escapeHtml(x.assigned_at||'')}</td></tr>`).join('')+'</table>';document.getElementById('ctlGroupList').innerHTML=(j.groups||[]).map(g=>`<div style="padding:9px;border-bottom:1px solid #252529"><b>${escapeHtml(g.title||String(g.id))}</b> · <code>${g.id}</code> · ${g.access==='deny'?'🔴 запрещены':'🟢 разрешены'} <button class="navbtn" onclick="toggleGroup(${g.id},'${g.access==='deny'?'allow':'deny'}')">${g.access==='deny'?'Разрешить':'Запретить'}</button></div>`).join('')||'Нет групп';document.getElementById('ctlUserList').innerHTML=(j.users||[]).slice(0,100).map(u=>`<div style="padding:7px;border-bottom:1px solid #252529">${escapeHtml(u.name||u.username||'Без имени')} · <code>${u.id}</code> · приглашено ${u.total_invited||0}</div>`).join('')||'Нет пользователей';loadMarketWallets()}
+async function loadMarketWallets(){let sel=document.getElementById('marketPlayer'),st=document.getElementById('marketWalletStatus'),panel=document.getElementById('marketWalletPanel');if(!sel)return;let r=await fetch('/api/market/wallets');if(r.status===403){panel.style.display='none';return}let j={};try{j=await r.json()}catch(e){}if(!r.ok){st.textContent='Ошибка загрузки: '+(j.error||r.status);return}let rows=j.players||[];sel.innerHTML=rows.map(x=>`<option value="${x.chat_id}:${x.user_id}">${escapeHtml((x.username?'@'+x.username:x.name)||x.user_id)} · ${x.balance} 💎 · chat ${x.chat_id}</option>`).join('');st.textContent=rows.length?'Игроков на рынке: '+rows.length:'Пока нет игроков в базе рынка'}
+async function updateMarketWallet(){let sel=document.getElementById('marketPlayer'),amount=Number(document.getElementById('marketAmount').value),mode=document.getElementById('marketMode').value,st=document.getElementById('marketWalletStatus');if(!sel.value||!Number.isInteger(amount)||amount<0){st.textContent='Укажи игрока и целое количество монет';return}let [chat_id,user_id]=sel.value.split(':');let r=await fetch('/api/market/wallet',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:Number(chat_id),user_id:Number(user_id),amount,mode})});let j={};try{j=await r.json()}catch(e){};st.textContent=r.ok?'✓ Новый баланс: '+j.balance+' 💎':'Ошибка: '+(j.error||r.status);if(r.ok)loadMarketWallets()}
+async function loadChanges(){let box=document.getElementById('changesList');box.innerHTML='<div class="empty">Загрузка…</div>';let r=await fetch('/api/changelog');if(!r.ok){box.innerHTML='<div class="empty">Не удалось загрузить историю</div>';return}let j=await r.json();box.innerHTML=(j.items||[]).map(c=>`<div class="mediaTools"><div class="eyebrow">${escapeHtml(c.date||'')}</div><h3 style="margin:7px 0 12px">${escapeHtml(c.title||'Обновление')}</h3><div>${(c.items||[]).map(i=>`<div style="padding:7px 0;border-bottom:1px solid #242428">✓ ${escapeHtml(i)}</div>`).join('')}</div></div>`).join('')||'<div class="empty">История пока пустая</div>'}
+async function loadUntagged(){let st=document.getElementById('untaggedStatus'),box=document.getElementById('untaggedList');st.textContent='Проверяю участников…';box.value='';let r=await fetch('/api/control/untagged');let j={};try{j=await r.json()}catch(e){}if(!r.ok){st.textContent='Ошибка: '+(j.error||r.status);return}let rows=(j.untagged||[]).map(u=>{let who=u.username?'@'+u.username:(u.name||'Без имени');return who+' | ID: '+u.id});box.value=rows.join('\n');st.textContent='В основном чате: '+(j.total_members||0)+' · админов исключено: '+(j.admins_excluded||0)+' · проверено известных: '+(j.checked||0)+' · без тега: '+rows.length}
+async function copyUntagged(){let box=document.getElementById('untaggedList'),st=document.getElementById('untaggedStatus');try{await navigator.clipboard.writeText(box.value);st.textContent='✓ Список скопирован'}catch(e){box.select();document.execCommand('copy');st.textContent='✓ Список скопирован'}}
+async function assignTagWeb(){let st=document.getElementById('tagStatus');st.textContent='Выдаю…';let body={chat_id:Number(document.getElementById('tagChat').value),user_id:Number(document.getElementById('tagUser').value),tag:document.getElementById('tagValue').value};let r=await fetch('/api/server-tags/assign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});let j=await r.json();st.textContent=r.ok?'✓ Тег выдан: '+j.tag:'Ошибка: '+(j.error||r.status);if(r.ok)loadControl()}
+async function toggleServerTags(){let b=document.getElementById('serverTagsToggle');let enabled=b.dataset.enabled!=='1';b.disabled=true;let r=await fetch('/api/control/server-tags',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});b.disabled=false;if(r.ok)loadControl();else{let j=await r.json().catch(()=>({}));document.getElementById('serverTagsState').textContent='Ошибка: '+(j.error||r.status)}}
+async function toggleGroup(chat_id,access){let r=await fetch('/api/control/group-access',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id,access})});if(r.ok)loadControl()}
+async function downloadFullBackup(){let code=prompt('Введите код полного бэкапа:');if(code===null)return;let st=document.getElementById('backupStatus'),btn=document.getElementById('backupBtn');st.textContent='Собираю актуальный ZIP…';btn.disabled=true;try{let r=await fetch('/api/backup/full',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code})});if(!r.ok){let j={};try{j=await r.json()}catch(e){};st.textContent=r.status===401?'Неверный код':'Ошибка: '+(j.error||r.status);return}let blob=await r.blob();let cd=r.headers.get('Content-Disposition')||'';let m=cd.match(/filename=\"?([^\";]+)\"?/i);let name=m?m[1]:'shinobi-full-backup.zip';let u=URL.createObjectURL(blob),a=document.createElement('a');a.href=u;a.download=name;document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(u);st.textContent='✓ ZIP скачан'}catch(e){st.textContent='Ошибка соединения'}finally{btn.disabled=false}}
+
+async function loadAiModeration(){let box=document.getElementById('aiModLog');box.innerHTML='<div class="empty">Загрузка…</div>';let r=await fetch('/api/ai-moderation-log');if(!r.ok){box.innerHTML='<div class="empty">Ошибка загрузки</div>';return}let j=await r.json(),rows=j.log||[];document.getElementById('aiModCount').textContent=rows.length;if(!rows.length){box.innerHTML='<div class="empty">Нарушений пока нет</div>';return}box.innerHTML='<div class="tablewrap"><table><thead><tr><th>Время</th><th>Пользователь</th><th>Чат</th><th>Сообщение</th><th>Правило</th><th>Наказание</th><th>Причина</th><th>Источник</th></tr></thead><tbody>'+rows.map(x=>`<tr><td>${escapeHtml(x.time||'—')}</td><td>${escapeHtml(x.user_name||String(x.user_id||''))}<br><span class="status">${x.username?'@'+escapeHtml(x.username):'ID '+x.user_id}</span></td><td>${escapeHtml(x.chat_title||String(x.chat_id||''))}</td><td style="max-width:320px;white-space:normal">${escapeHtml(x.message_text||'—')}</td><td>${x.rule ? 'Правило '+x.rule+', пункт '+(x.subpoint||1) : '—'}</td><td>${escapeHtml(x.action_text||x.action||'—')}</td><td style="max-width:280px;white-space:normal">${escapeHtml(x.reason||'—')}</td><td>${escapeHtml(x.source_text||'AI')}</td></tr>`).join('')+'</tbody></table></div>'}
+async function loadChatSummary(){let box=document.getElementById('chatSummaryBox');box.innerHTML='<div class="empty">Загрузка…</div>';let r=await fetch('/api/chat-summary');if(!r.ok){box.innerHTML='<div class="empty">Ошибка загрузки</div>';return}let j=await r.json();let chats=j.chats||[];if(!chats.length){box.innerHTML='<div class="empty">Пока нет собранной статистики. Она появится после новых сообщений в чатах.</div>';return}box.innerHTML=chats.map(c=>`<div class="infoCard" style="grid-column:span 2"><div class="infoLabel">${escapeHtml(c.title||String(c.chat_id))}</div><div style="font-size:12px;color:#666;margin:6px 0 14px">ID ${c.chat_id}</div><div class="infoGrid"><div><div class="infoLabel">УЧАСТНИКОВ</div><div class="infoValue">${c.members??'—'}</div></div><div><div class="infoLabel">АКТИВНЫ ЗА 15 МИН</div><div class="infoValue">${c.active_15m||0}</div></div><div><div class="infoLabel">СООБЩЕНИЙ СЕГОДНЯ</div><div class="infoValue">${c.messages_today||0}</div></div><div><div class="infoLabel">ПИК ЗА ЧАС</div><div class="infoValue">${c.peak_messages||0}</div><div class="status">${c.peak_hour||'—'}</div></div><div><div class="infoLabel">PING API</div><div class="infoValue">${c.ping_ms??'—'} мс</div></div><div><div class="infoLabel">ВСЕГО ОТСЛЕЖЕНО СООБЩЕНИЙ</div><div class="infoValue">${c.tracked_total_messages||0}</div></div></div></div>`).join('')}
+
+
+async function loadOctoberPlan(){let box=document.getElementById('octoberPlanBox');if(!box)return;box.innerHTML='<div class="empty">Загрузка…</div>';let r=await fetch('/api/october-plan');if(!r.ok){box.innerHTML='<div class="empty">Доступ только тех. администратору</div>';return}let j=await r.json(),items=j.items||[];let done=items.filter(x=>x.done).length;box.innerHTML=`<div style="padding:16px;border-bottom:1px solid #252529"><b>${done} / ${items.length}</b> выполнено • ${items.length-done} осталось</div><div style="overflow:auto"><table><tr><th>Готово</th><th>Дата</th><th>Активность</th><th>Формат</th><th>Текст поста</th></tr>${items.map(x=>`<tr style="${x.done?'opacity:.55':''}"><td><input type="checkbox" ${x.done?'checked':''} onchange="setOctoberDone('${x.date}',this.checked)"></td><td><b>${escapeHtml(x.date.split('-').reverse().join('.'))}</b></td><td>${escapeHtml(x.title||'')}</td><td>${escapeHtml(x.format||'')}</td><td style="white-space:normal;min-width:360px">${escapeHtml(x.post_text||'')}</td></tr>`).join('')}</table></div>`}
+async function setOctoberDone(date,done){let r=await fetch('/api/october-plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({date,done})});if(!r.ok){alert('Не удалось сохранить отметку');loadOctoberPlan();return}loadOctoberPlan()}
+
+loadReports();</script></body></html>'''
+
+
+async def login_page(request):
+    if _read_session(request):
+        raise web.HTTPFound("/dashboard")
+    return web.Response(text=LOGIN_HTML.replace("__ERROR__", ""), content_type="text/html")
+
+
+async def login(request):
+    data = await request.post()
+    role = data.get("role", "")
+    password = data.get("password", "")
+    expected = os.getenv("OWNER_PASSWORD" if role == "owner" else "TECH_ADMIN_PASSWORD", "")
+    if role not in ("owner", "tech") or not expected or not secrets.compare_digest(password, expected):
+        err = '<div class="err">Неверная роль или пароль доступа.</div>'
+        return web.Response(text=LOGIN_HTML.replace("__ERROR__", err), content_type="text/html", status=401)
+    response = web.HTTPFound("/dashboard")
+    response.set_cookie("shinobi_session", _make_session(role), httponly=True, secure=True, samesite="Lax", max_age=60*60*24*7)
+    raise response
+
+
+async def logout(request):
+    response = web.HTTPFound("/")
+    response.del_cookie("shinobi_session")
+    raise response
+
+
+async def dashboard(request):
+    session = _read_session(request)
+    role = "👑 OWNER" if session["role"] == "owner" else "🛠 TECH ADMIN"
+    html = DASHBOARD_HTML.replace("__ROLE__", role)
+    tech_nav = '<button class="navbtn" onclick="showPage(\'octoberPage\',this);loadOctoberPlan()">📅 План на октябрь</button>' if session.get("role") == "tech" else ""
+    return web.Response(text=html.replace("__TECH_NAV__", tech_nav), content_type="text/html")
+
+
+async def reports(request):
+    return web.json_response({"reports": list_reports()}, dumps=lambda x: json.dumps(x, ensure_ascii=False))
+
+
+async def create_report_from_web(request):
+    session = _read_session(request)
+    # Веб-генерация доступна обеим внутренним ролям: владельцу и тех. админу.
+    # API-key также остаётся допустимым для служебной интеграции.
+    if not session and not _api_authorized(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    if session and session.get("role") not in ("owner", "tech"):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        requested_by = "web:" + (session.get("role") if session else "api")
+        report = create_report_snapshot(requested_by=requested_by)
+        return web.json_response({"ok": True, "report": report}, dumps=lambda x: json.dumps(x, ensure_ascii=False))
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+async def report_file(request):
+    report_id = request.match_info["report_id"]
+    filename = request.match_info["filename"]
+    if Path(filename).name != filename or Path(report_id).name != report_id:
+        raise web.HTTPBadRequest()
+    path = REPORTS_DIR / report_id / filename
+    if not path.exists() or not path.is_file():
+        raise web.HTTPNotFound()
+    return web.FileResponse(path)
+
+
+
+SERVER_TAGS = ["Ру серв","Крд серв","Мск серв","Еу серв","Узб серв","Екб серв","Укр серв","Сиб серв","Дв серв","Вн серв","Еу/Ру серв","Ру/Крд серв","Екб/Серв Ру/Мск серв","Сиб/Дв серв","Ру/Еу серв","Ру/Вн серв","Ру/Екб серв","Ру/Сиб/Мск серв","Унив серв"]
+
+def _bot_data_read():
+    p=BASE_DIR/'data.json'
+    try: return json.loads(p.read_text(encoding='utf-8')) if p.exists() else {}
+    except Exception: return {}
+
+def _bot_data_write(data):
+    p=BASE_DIR/'data.json'; tmp=BASE_DIR/'data.web.tmp'
+    tmp.write_text(json.dumps(data,ensure_ascii=False,indent=4),encoding='utf-8'); tmp.replace(p)
+    try:
+        from db_storage import sync_to_db
+        sync_to_db()
+    except Exception as exc: print(f'[WEB DB] {exc}')
+
+async def changelog_api(request):
+    path = BASE_DIR / "changelog.json"
+    try:
+        items = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+    except Exception:
+        items = []
+    items = sorted(items, key=lambda item: str(item.get("date", "")), reverse=True)
+    return web.json_response({"items": items}, dumps=lambda obj: json.dumps(obj, ensure_ascii=False))
+
+async def control_snapshot(request):
+    d=_bot_data_read(); installed={str(x) for x in d.get('installed_groups',[])}
+    groups=[]
+    for cid,g in d.get('known_groups',{}).items():
+        if cid in installed:
+            groups.append({'id':int(cid),'title':g.get('title',''),'status':g.get('bot_status',''),'access':d.get('group_command_access',{}).get(cid,'allow')})
+    users=[]
+    for uid,u in d.get('users',{}).items():
+        users.append({'id':int(uid),'name':u.get('name') or u.get('full_name',''),'username':u.get('username',''),'total_invited':int(u.get('total_invited',0) or 0)})
+    assignments=d.get('server_tag_assignments',{})
+    
+    tag_enabled = bool(d.get('server_tags_enabled', True))
+    try:
+        from db_storage import get_setting
+        v = get_setting('server_tags_enabled', None)
+        if isinstance(v, bool): tag_enabled = v
+    except Exception: pass
+    return web.json_response({'counts':{'users':len(users),'groups':len(groups),'tags':len(assignments)},'maintenance':bool(d.get('maintenance_mode')),'groups':groups,'users':users,'assignments':assignments,'server_tags':SERVER_TAGS,'server_tags_enabled':tag_enabled},dumps=lambda x:json.dumps(x,ensure_ascii=False))
+
+
+async def referrals_api(request):
+    d = _bot_data_read()
+    users = d.get("users", {}) or {}
+    links = d.get("links", {}) or {}
+    rows = []
+    for link, info in links.items():
+        owner_id = info.get("owner_id")
+        owner = users.get(str(owner_id), {}) if owner_id is not None else {}
+        rows.append({
+            "link": link,
+            "type": info.get("type", "referral"),
+            "owner_id": owner_id,
+            "name": owner.get("name") or info.get("label") or "Без имени",
+            "username": owner.get("username", ""),
+            "invited": int(info.get("invited", 0) or 0),
+            "created": info.get("created", ""),
+        })
+    rows.sort(key=lambda x: (-x["invited"], str(x["name"]).lower()))
+    return web.json_response({"links": rows}, dumps=lambda x: json.dumps(x, ensure_ascii=False))
+
+async def referral_delete(request):
+    session = _read_session(request)
+    if not session or session.get("role") not in ("owner", "tech"):
+        return web.json_response({"error": "owner_or_tech_only"}, status=403)
+    try:
+        payload = await request.json()
+        link = str(payload.get("link", "")).strip()
+    except Exception:
+        return web.json_response({"error": "invalid_data"}, status=400)
+    d = _bot_data_read(); links = d.get("links", {})
+    info = links.get(link)
+    if not info:
+        return web.json_response({"error": "link_not_found"}, status=404)
+    if info.get("type") == "advertising" or link == d.get("advertising_link") or link == ADVERTISING_LINK:
+        return web.json_response({"error": "advertising_link_protected"}, status=400)
+    # Сначала пробуем отозвать ссылку в Telegram, затем удаляем её из базы сайта/бота.
+    revoked = False
+    token = os.getenv("BOT_TOKEN", "").strip()
+    chat_id = os.getenv("CHAT_ID", "-1004368701081").strip()
+    if token:
+        try:
+            async with aiohttp.ClientSession() as session_http:
+                async with session_http.post(f"https://api.telegram.org/bot{token}/revokeChatInviteLink", json={"chat_id": chat_id, "invite_link": link}, timeout=10) as resp:
+                    result = await resp.json()
+                    revoked = bool(result.get("ok"))
+        except Exception:
+            revoked = False
+    owner_id = info.get("owner_id")
+    del links[link]
+    if owner_id is not None:
+        u = (d.get("users") or {}).get(str(owner_id), {})
+        if isinstance(u.get("links"), list): u["links"] = [x for x in u["links"] if x != link]
+    _bot_data_write(d)
+    # Web API работает в том же процессе, что и bot.py: синхронизируем и RAM-копию,
+    # чтобы следующий save_data() не вернул удалённую ссылку обратно.
+    try:
+        import sys
+        bot_module = sys.modules.get("__main__")
+        runtime_data = getattr(bot_module, "data", None)
+        if isinstance(runtime_data, dict):
+            runtime_data.get("links", {}).pop(link, None)
+            if owner_id is not None:
+                ru = runtime_data.get("users", {}).get(str(owner_id), {})
+                if isinstance(ru.get("links"), list): ru["links"] = [x for x in ru["links"] if x != link]
+    except Exception:
+        pass
+    return web.json_response({"ok": True, "revoked_in_telegram": revoked})
+
+async def joins_analytics_api(request):
+    d = _bot_data_read(); history = d.get("join_history", []) or []
+    today = datetime.now().date(); days = 30
+    try: days = max(7, min(365, int(request.query.get("days", 30))))
+    except Exception: pass
+    start = today - timedelta(days=days-1)
+    counts = {(start + timedelta(days=i)).isoformat(): 0 for i in range(days)}
+    for row in history:
+        raw = row.get("joined_at") or row.get("joined") or ""
+        try: day = datetime.fromisoformat(raw).date()
+        except Exception: continue
+        key = day.isoformat()
+        if key in counts: counts[key] += 1
+    today_count = counts.get(today.isoformat(), 0)
+    yesterday = today - timedelta(days=1); yesterday_count = counts.get(yesterday.isoformat(), 0)
+    delta = today_count - yesterday_count
+    total = sum(counts.values())
+    series = [{"date": k, "joins": v} for k,v in counts.items()]
+    return web.json_response({"today": today_count, "yesterday": yesterday_count, "delta": delta, "period_total": total, "days": days, "series": series}, dumps=lambda x: json.dumps(x, ensure_ascii=False))
+
+MARKET_WALLETS_FILE = BASE_DIR / "market_wallets.json"
+
+def _market_wallets_read():
+    try:
+        return json.loads(MARKET_WALLETS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def _market_wallets_write(data):
+    tmp = BASE_DIR / "market_wallets.web.tmp"
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(MARKET_WALLETS_FILE)
+    try:
+        from db_storage import sync_to_db
+        sync_to_db()
+    except Exception as exc:
+        print(f"[DB] market wallets sync failed: {exc}")
+
+async def market_wallets_api(request):
+    session = _read_session(request)
+    if not session or session.get("role") not in ("owner", "tech"):
+        return web.json_response({"error":"owner_or_tech_only"}, status=403)
+    d = _bot_data_read(); wallets = _market_wallets_read(); rows=[]
+    for chat_id, chat in (d.get("game_hub") or {}).items():
+        for uid, player in (chat.get("players") or {}).items():
+            balance = int(wallets.get(str(chat_id), {}).get(str(uid), player.get("balance", 0)))
+            try:
+                from db_storage import get_setting
+                persisted = get_setting(f"market_wallet:{int(chat_id)}:{str(uid)}", None)
+                if persisted is not None:
+                    balance = max(0, int(persisted))
+            except Exception:
+                pass
+            rows.append({"chat_id":str(chat_id),"user_id":str(uid),"username":player.get("username", ""),"name":player.get("name", ""),"balance":balance})
+    return web.json_response({"players":rows}, dumps=lambda x:json.dumps(x,ensure_ascii=False))
+
+async def market_wallet_update(request):
+    session = _read_session(request)
+    if not session or session.get("role") not in ("owner", "tech"):
+        return web.json_response({"error":"owner_or_tech_only"}, status=403)
+    try:
+        payload=await request.json(); chat_id=str(int(payload.get("chat_id"))); uid=str(int(payload.get("user_id"))); amount=int(payload.get("amount")); mode=str(payload.get("mode","add"))
+        if amount < 0 or amount > 1_000_000_000: raise ValueError()
+        if mode not in {"add","set"}: raise ValueError()
+    except Exception:
+        return web.json_response({"error":"invalid_data"}, status=400)
+    d=_bot_data_read(); player=((d.get("game_hub") or {}).get(chat_id,{}).get("players") or {}).get(uid)
+    if not player: return web.json_response({"error":"player_not_found"}, status=404)
+    wallets=_market_wallets_read(); current=int(wallets.get(chat_id,{}).get(uid,player.get("balance",0)))
+    new_balance = current + amount if mode == "add" else amount
+    wallets.setdefault(chat_id,{})[uid]=new_balance
+    _market_wallets_write(wallets)
+    # Save the wallet independently in PostgreSQL too. This prevents a bot/web
+    # process race from restoring an older JSON snapshot after a site edit.
+    try:
+        from db_storage import set_setting
+        set_setting(f"market_wallet:{int(chat_id)}:{uid}", new_balance)
+    except Exception as exc:
+        print(f"[DB] market wallet setting save failed: {exc}")
+    # Keep game_hub's cached balance consistent for exports/fallbacks.
+    try:
+        player["balance"] = new_balance
+        _bot_data_write(d)
+    except Exception as exc:
+        print(f"[WEB] game_hub balance cache save failed: {exc}")
+    return web.json_response({"ok":True,"balance":new_balance})
+
+async def web_assign_server_tag(request):
+    try: payload=await request.json(); chat_id=int(payload.get('chat_id')); user_id=int(payload.get('user_id')); tag=str(payload.get('tag','')).strip()
+    except Exception: return web.json_response({'error':'invalid_data'},status=400)
+    if tag not in SERVER_TAGS: return web.json_response({'error':'unknown_tag'},status=400)
+    token=os.getenv('BOT_TOKEN','').strip()
+    if not token: return web.json_response({'error':'BOT_TOKEN_not_configured'},status=500)
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            async with session.post(f'https://api.telegram.org/bot{token}/setChatMemberTag',json={'chat_id':chat_id,'user_id':user_id,'tag':tag}) as resp:
+                result=await resp.json(content_type=None)
+                if not resp.ok or not result.get('ok'): return web.json_response({'error':result.get('description','telegram_error')},status=400)
+        d=_bot_data_read(); d.setdefault('server_tag_assignments',{})[f'{chat_id}:{user_id}']={'chat_id':chat_id,'user_id':user_id,'name':'','username':'','tag':tag,'assigned_at':datetime.now().isoformat()}; _bot_data_write(d)
+        return web.json_response({'ok':True,'tag':tag})
+    except Exception as exc: return web.json_response({'error':str(exc)},status=500)
+
+async def web_server_tags_toggle(request):
+    try:
+        payload = await request.json()
+        enabled = payload.get('enabled')
+        if not isinstance(enabled, bool):
+            raise ValueError('enabled must be boolean')
+    except Exception:
+        return web.json_response({'error':'invalid_data'}, status=400)
+    # PostgreSQL — общий источник истины между веб-процессом и ботом (даже если это разные контейнеры Railway).
+    try:
+        from db_storage import set_setting
+        set_setting('server_tags_enabled', enabled)
+    except Exception as exc:
+        return web.json_response({'error':'settings_db_error','detail':str(exc)}, status=500)
+    d = _bot_data_read()
+    d['server_tags_enabled'] = enabled
+    _bot_data_write(d)
+    return web.json_response({'ok':True,'enabled':enabled})
+
+async def web_untagged_users(request):
+    """Проверяет известных боту пользователей через Telegram и возвращает участников CHAT_ID без тега."""
+    d = _bot_data_read()
+    token = os.getenv('BOT_TOKEN','').strip()
+    try:
+        chat_id = int(os.getenv('CHAT_ID') or d.get('main_chat_id') or -1004368701081)
+    except Exception:
+        chat_id = -1004368701081
+    if not token:
+        return web.json_response({'error':'BOT_TOKEN_not_configured'}, status=500)
+
+    candidates = {}
+    for uid, u in d.get('users', {}).items():
+        try: candidates[int(uid)] = {'name':u.get('name') or u.get('full_name',''), 'username':u.get('username','')}
+        except Exception: pass
+    for rec in d.get('server_tag_assignments', {}).values():
+        try: candidates[int(rec.get('user_id'))] = {'name':rec.get('name',''), 'username':rec.get('username','')}
+        except Exception: pass
+    # Пользователи из заявок тоже считаются известными боту.
+    for rec in d.get('pending_join_requests', {}).values():
+        try: candidates[int(rec.get('user_id'))] = {'name':rec.get('name',''), 'username':rec.get('username','')}
+        except Exception: pass
+
+    untagged=[]; blocked=[]; checked=0
+    total_members=0; admin_ids=set()
+    timeout=aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        # Всегда работаем только с основным чатом. Staff здесь не используется.
+        try:
+            async with session.post(f'https://api.telegram.org/bot{token}/getChatMemberCount', json={'chat_id':chat_id}) as resp:
+                count_result=await resp.json(content_type=None)
+            if count_result.get('ok'):
+                total_members=int(count_result.get('result') or 0)
+        except Exception:
+            pass
+        # Администраторов основного чата не считаем: у них специальные админские теги.
+        try:
+            async with session.post(f'https://api.telegram.org/bot{token}/getChatAdministrators', json={'chat_id':chat_id}) as resp:
+                admins_result=await resp.json(content_type=None)
+            if admins_result.get('ok'):
+                admin_ids={int((x.get('user') or {}).get('id')) for x in (admins_result.get('result') or []) if (x.get('user') or {}).get('id')}
+        except Exception:
+            pass
+        for uid, meta in candidates.items():
+            if uid in admin_ids:
+                continue
+            try:
+                async with session.post(f'https://api.telegram.org/bot{token}/getChatMember', json={'chat_id':chat_id,'user_id':uid}) as resp:
+                    result=await resp.json(content_type=None)
+                if not result.get('ok'): continue
+                member=result.get('result') or {}; status=str(member.get('status','')); checked += 1
+                if status == 'kicked':
+                    blocked.append({'id':uid,'name':meta.get('name',''),'username':meta.get('username',''),'reason':'ЧС / заблокирован в чате'})
+                    continue
+                if status in ('left',''): continue
+                tag=str(member.get('tag') or '').strip()
+                if not tag:
+                    user=member.get('user') or {}
+                    untagged.append({'id':uid,'name':user.get('first_name') or meta.get('name',''),'username':user.get('username') or meta.get('username','')})
+            except Exception:
+                continue
+    return web.json_response({'chat_id':chat_id,'total_members':total_members,'admins_excluded':len(admin_ids),'known_candidates':len(candidates),'checked':checked,'untagged':untagged,'blocked':blocked}, dumps=lambda x:json.dumps(x,ensure_ascii=False))
+
+
+async def web_group_access(request):
+    try: payload=await request.json(); chat_id=int(payload.get('chat_id')); access=str(payload.get('access'))
+    except Exception: return web.json_response({'error':'invalid_data'},status=400)
+    if access not in ('allow','deny'): return web.json_response({'error':'invalid_access'},status=400)
+    d=_bot_data_read(); d.setdefault('group_command_access',{})[str(chat_id)]=access; _bot_data_write(d)
+    # Сайт и Telegram-бот работают в одном процессе. Обновляем RAM-копию сразу,
+    # чтобы переключатель применялся без рестарта и следующий save_data() не откатил настройку.
+    try:
+        import sys
+        bot_module = sys.modules.get('__main__')
+        runtime_data = getattr(bot_module, 'data', None)
+        if isinstance(runtime_data, dict):
+            runtime_data.setdefault('group_command_access', {})[str(chat_id)] = access
+    except Exception:
+        pass
+    return web.json_response({'ok':True,'access':access})
+
+
+def _json_safe(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return {"__type__": "bytes", "base64": base64.b64encode(bytes(value)).decode("ascii")}
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    return str(value)
+
+
+def _export_postgres_full():
+    database_url = os.getenv("DATABASE_URL", "").strip()
+    if not database_url:
+        return {"configured": False, "tables": {}}
+    import psycopg2
+    result = {"configured": True, "exported_at": datetime.now().isoformat(timespec="seconds"), "tables": {}}
+    with psycopg2.connect(database_url, connect_timeout=15) as conn, conn.cursor() as cur:
+        cur.execute("""SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname='public' ORDER BY tablename""")
+        tables = [row[0] for row in cur.fetchall()]
+        from psycopg2 import sql
+        for table in tables:
+            cur.execute(sql.SQL("SELECT * FROM {} ORDER BY 1").format(sql.Identifier(table)))
+            cols = [d.name for d in cur.description]
+            rows = [[_json_safe(v) for v in row] for row in cur.fetchall()]
+            result["tables"][table] = {"columns": cols, "rows": rows, "row_count": len(rows)}
+    return result
+
+
+def _build_full_backup_zip():
+    # Сначала принудительно синхронизируем локальные данные с PostgreSQL.
+    try:
+        from db_storage import sync_to_db
+        sync_to_db()
+    except Exception as exc:
+        print(f"[BACKUP] sync_to_db: {exc}")
+    db_export = _export_postgres_full()
+    out = io.BytesIO()
+    skip_dirs = {"__pycache__", ".git", ".idea", ".vscode", ".venv", "venv"}
+    skip_names = {".env"}
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        for src in BASE_DIR.rglob("*"):
+            if not src.is_file():
+                continue
+            rel = src.relative_to(BASE_DIR)
+            if any(part in skip_dirs for part in rel.parts):
+                continue
+            if src.name in skip_names or src.suffix.lower() in {".pyc", ".pyo"}:
+                continue
+            if src.name.startswith("shinobi-full-backup-") and src.suffix.lower()==".zip":
+                continue
+            zf.write(src, (Path("shinobi-bot-main") / rel).as_posix())
+        zf.writestr("BACKUP/database_full_export.json", json.dumps(db_export, ensure_ascii=False, indent=2))
+        zf.writestr("BACKUP/README.txt", "SHINOBI TEAM FULL BACKUP\nСоздан: " + datetime.now().isoformat(timespec="seconds") + "\nСодержит актуальные файлы бота и полный экспорт таблиц PostgreSQL.\n.env и секреты окружения намеренно не включены.\n")
+    return out.getvalue()
+
+
+async def download_full_backup(request):
+    session = _read_session(request)
+    if not session or session.get("role") not in ("owner", "tech"):
+        return web.json_response({"error": "forbidden"}, status=403)
+    expected = os.getenv("BACKUP_EXPORT_CODE", "").strip()
+    if not expected:
+        return web.json_response({"error": "BACKUP_EXPORT_CODE_not_configured"}, status=503)
+    try:
+        payload = await request.json()
+        code = str(payload.get("code", ""))
+    except Exception:
+        return web.json_response({"error": "invalid_data"}, status=400)
+    if not secrets.compare_digest(code, expected):
+        return web.json_response({"error": "invalid_backup_code"}, status=401)
+    try:
+        blob = await __import__('asyncio').to_thread(_build_full_backup_zip)
+    except Exception as exc:
+        print(f"[BACKUP] Ошибка: {exc}")
+        return web.json_response({"error": "backup_failed"}, status=500)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"shinobi-full-backup-{stamp}.zip"
+    return web.Response(body=blob, content_type="application/zip", headers={"Content-Disposition": f'attachment; filename="{filename}"', "Cache-Control": "no-store"})
+
+
+
+async def ai_moderation_log_api(request):
+    try:
+        payload=json.loads((BASE_DIR / "data.json").read_text(encoding="utf-8"))
+    except Exception:
+        payload={}
+    records=list((payload.get("shinobi_moderation",{}) or {}).get("records",[]) or [])[-500:]
+    out=[]
+    for x in reversed(records):
+        y=dict(x)
+        try: y["time"]=datetime.fromtimestamp(int(y.get("ts",0))).strftime("%d.%m.%Y %H:%M:%S")
+        except Exception: y["time"]="—"
+        kind=y.get("kind",""); dur=int(y.get("duration",0) or 0)
+        if kind in {"pred","warn"}: action={"pred":"ПРЕД • 7 дней","warn":"WARN • 7 дней"}[kind]
+        elif kind=="mute": action=f"Мут {max(1,dur//60)} мин."
+        elif kind=="ban": action="Бан навсегда" if not dur else f"Бан {max(1,dur//3600)} ч."
+        else: action=kind
+        y["action_text"]=action + (" • снято" if y.get("revoked") else "")
+        y["user_name"]=y.get("user_name") or str(y.get("user_id", ""))
+        y["message_text"]=y.get("message_text") or "—"
+        y["chat_title"]=y.get("chat_title") or str(y.get("chat_id", ""))
+        y["confidence"]=y.get("confidence") or 0
+        y["source_text"]="AI" if y.get("source")=="ai" else ("SYSTEM" if y.get("source")=="system" else y.get("actor_name","ADMIN"))
+        out.append(y)
+    return web.json_response({"beta":True,"log":out},dumps=lambda x:json.dumps(x,ensure_ascii=False))
+
+async def chat_summary_api(request):
+    rows_by_id = {int(x["chat_id"]): x for x in chat_summary_snapshot()}
+    try:
+        bot_data = json.loads((BASE_DIR / "data.json").read_text(encoding="utf-8"))
+    except Exception:
+        bot_data = {}
+    for raw_id in bot_data.get("installed_groups", []):
+        cid = int(raw_id); meta = (bot_data.get("known_groups", {}) or {}).get(str(cid), {})
+        rows_by_id.setdefault(cid, {"chat_id": cid, "title": meta.get("title", str(cid)), "messages_today": 0, "peak_hour": "—", "peak_messages": 0, "active_15m": 0, "active_60m": 0, "tracked_total_messages": 0})
+    rows = list(rows_by_id.values()); token = os.getenv("BOT_TOKEN", "").strip()
+    async with aiohttp.ClientSession() as session:
+        for row in rows:
+            row["members"] = None; row["ping_ms"] = None
+            if not token: continue
+            try:
+                started = time.perf_counter()
+                async with session.get(f"https://api.telegram.org/bot{token}/getChatMemberCount", params={"chat_id": row["chat_id"]}, timeout=8) as resp: payload = await resp.json()
+                row["ping_ms"] = round((time.perf_counter() - started) * 1000)
+                if payload.get("ok"): row["members"] = payload.get("result")
+            except Exception: pass
+    rows.sort(key=lambda x: str(x.get("title", "")))
+    return web.json_response({"chats": rows, "uptime_seconds": uptime_seconds(), "updated_at": datetime.now().isoformat(timespec="seconds")}, dumps=lambda x: json.dumps(x, ensure_ascii=False))
+
+async def start_stats_api():
+    app = web.Application(middlewares=[auth_middleware])
+    app.router.add_get("/", login_page)
+    app.router.add_post("/login", login)
+    app.router.add_get("/logout", logout)
+    app.router.add_get("/dashboard", dashboard)
+    app.router.add_get("/api/status", status)
+    app.router.add_get("/api/system-info", system_info)
+    app.router.add_get("/api/chat-summary", chat_summary_api)
+    app.router.add_get("/api/ai-moderation-log", ai_moderation_log_api)
+    app.router.add_get("/api/october-plan", october_plan_api)
+    app.router.add_post("/api/october-plan", october_plan_update)
+    app.router.add_post("/api/system/version", update_version)
+    app.router.add_get("/media/{kind}", media_file)
+    app.router.add_post("/api/media/{kind}", upload_media)
+    app.router.add_get("/api/reports", reports)
+    app.router.add_get("/api/control", control_snapshot)
+    app.router.add_get("/api/referrals", referrals_api)
+    app.router.add_post("/api/referrals/delete", referral_delete)
+    app.router.add_get("/api/joins-analytics", joins_analytics_api)
+    app.router.add_get("/api/changelog", changelog_api)
+    app.router.add_post("/api/server-tags/assign", web_assign_server_tag)
+    app.router.add_post("/api/control/server-tags", web_server_tags_toggle)
+    app.router.add_get("/api/control/untagged", web_untagged_users)
+    app.router.add_post("/api/control/group-access", web_group_access)
+    app.router.add_get("/api/market/wallets", market_wallets_api)
+    app.router.add_post("/api/market/wallet", market_wallet_update)
+    app.router.add_post("/api/backup/full", download_full_backup)
+    app.router.add_post("/api/reports", create_report_from_web)
+    app.router.add_get("/api/reports/{report_id}/{filename}", report_file)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", os.getenv("SHINOBI_STATS_PORT", "8080")))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"SHINOBI STATS WEB + API запущен на порту {port}")
+    return runner

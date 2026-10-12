@@ -1,0 +1,22 @@
+{
+  "8714004313": {
+    "city": "Киев",
+    "country": "Украина",
+    "timezone": "Europe/Kyiv"
+  },
+  "8506203337": {
+    "city": "Москва",
+    "country": "Россия",
+    "timezone": "Europe/Moscow"
+  },
+  "5921924076": {
+    "city": "Владивосток",
+    "country": "Россия",
+    "timezone": "Asia/Vladivostok"
+  },
+  "415581247": {
+    "city": "Москва",
+    "country": "Россия",
+    "timezone": "Europe/Moscow"
+  }
+}
