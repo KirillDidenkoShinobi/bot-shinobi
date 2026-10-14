@@ -5351,38 +5351,24 @@ async def chat_summary_broadcast_loop():
         await asyncio.sleep(6 * 60 * 60)
 
 async def main():
-    print("Удаляю старый webhook...")
-
-    # Удаляем webhook перед запуском polling
-    await bot.delete_webhook(drop_pending_updates=False)
-
-    print("Webhook удалён; ожидающие обновления Telegram сохранены.")
-    print("=" * 50)
-    print(" SHINOBI TEAM REFERRAL BOT")
-    print(" БОТ ЗАПУЩЕН")
-    print("=" * 50)
-
+    # HTTP must start before any Telegram network call. Otherwise a Telegram
+    # outage prevents Railway from ever receiving a listening web server.
     await start_stats_api()
-
-    # Каждые несколько секунд зеркалим JSON, Excel и архив Shinobi Stats в PostgreSQL.
+    print("[HUB] HTTP server started; connecting Telegram", flush=True)
     asyncio.create_task(persistence_loop())
     asyncio.create_task(staff_random_reply_loop())
     asyncio.create_task(server_tag_cleanup_loop())
     asyncio.create_task(chat_summary_broadcast_loop())
-    # Напоминания контент-плана в ЛС отключены по запросу владельца.
-    # asyncio.create_task(october_content_reminder_loop())
-
-    await dp.start_polling(
-        bot,
-        allowed_updates=[
-            "message",
-            "callback_query",
-            "chat_member",
-            "my_chat_member",
-            "chat_join_request",
-            "message_reaction"
-        ]
-    )
+    allowed = ["message", "callback_query", "chat_member", "my_chat_member", "chat_join_request", "message_reaction"]
+    while True:
+        try:
+            await bot.delete_webhook(drop_pending_updates=False)
+            await dp.start_polling(bot, allowed_updates=allowed, handle_signals=False, close_bot_session=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("[BOT] Telegram unavailable; HTTP remains running")
+        await asyncio.sleep(10)
 
 
 if __name__ == "__main__":
