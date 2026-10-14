@@ -49,7 +49,7 @@ def role(uid):
     record=_execute('SELECT role FROM hub_staff_roles WHERE uid=?',(int(uid),),fetch=True)
     if record:
         return None if record[0]=='disabled' else record[0]
-    for role_name, env in [('deputy','HUB_DEPUTY_IDS'),('admin','HUB_ADMIN_IDS'),('moderator','HUB_MODERATOR_IDS')]:
+    for role_name, env in [('deputy','HUB_DEPUTY_IDS'),('tech_admin','HUB_TECH_ADMIN_IDS'),('admin','HUB_ADMIN_IDS'),('moderator','HUB_MODERATOR_IDS')]:
         if uid in [x.strip() for x in os.getenv(env,'').split(',') if x.strip()]:return role_name
     return None
 
@@ -67,7 +67,7 @@ def staff_list():
 
 def set_staff_role(uid,new_role):
     init()
-    if new_role not in ('deputy','admin','moderator','disabled'):raise ValueError('invalid role')
+    if new_role not in ('deputy','tech_admin','admin','moderator','disabled'):raise ValueError('invalid role')
     if str(uid) in [x.strip() for x in os.getenv('HUB_OWNER_IDS','1197818066').split(',')]:raise ValueError('owner is managed in Railway')
     # Explicit override wins over legacy environment roles.
     with LOCK:

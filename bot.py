@@ -28,6 +28,7 @@ from aiogram.types import (
     CallbackQuery,
     FSInputFile,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     KeyboardButton,
     WebAppInfo,
     MessageReactionUpdated,
@@ -2763,23 +2764,52 @@ async def start_handler(message: Message, state: FSMContext):
         await show_schedule_menu(message, state)
         return
 
-    await message.answer(
-        "🥷 <b>SHINOBI TEAM BOT</b>\n\n"
-        f"👤 {message.from_user.full_name}\n"
-        f"🆔 ID: <code>{message.from_user.id}</code>\n\n"
-        "Ты успешно авторизован в системе.\n\n"
-        "Используй автоматизированную систему Shinobi Team для управления графиком, персональными ссылками и рабочими инструментами 👇",
-        reply_markup=main_keyboard(message.from_user.id),
-        parse_mode="HTML"
-    )
-    await message.answer("⚡ Быстрые действия закреплены под строкой ввода.", reply_markup=quick_reply_keyboard(message.from_user.id))
-    # Site login is offered only to explicitly allowlisted Telegram IDs.
+    # ЛС бота служит только точкой входа в Hub: без старого меню и клавиатуры.
     import hub_auth
-    if hub_auth.role(message.from_user.id):
-        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-        base=os.getenv('HUB_PUBLIC_URL','').strip().rstrip('/')
-        if base.startswith('https://'):
-            await message.answer("🔐 <b>SHINOBI TEAM HUB</b>\n\nДля входа в админ-панель перейдите на сайт и нажмите <b>«Войти через Telegram»</b>. Подтверждение личности выполняется на сайте через Telegram Login.",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🌐 Перейти на сайт",url=base)]]))
+    role = hub_auth.role(message.from_user.id)
+    if not role:
+        await message.answer(
+            "🥷 <b>SHINOBI TEAM</b>\n\n"
+            "Этот бот предназначен для администрации сообщества. "
+            "Если вам нужен доступ к панели, обратитесь к владельцу.",
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    base = os.getenv("HUB_PUBLIC_URL", "").strip().rstrip("/")
+    if not base.startswith("https://"):
+        base = WEBAPP_URL.rstrip("/") if WEBAPP_URL.startswith("https://") else ""
+
+    role_labels = {"owner": "Владелец", "deputy": "Заместитель", "admin": "Администратор"}
+    label = role_labels.get(str(role).lower(), "Сотрудник администрации")
+    await message.answer(
+        "🥷 <b>SHINOBI TEAM | STAFF HUB</b>\n\n"
+        f"👋 Добро пожаловать, <b>{html.escape(message.from_user.full_name)}</b>!\n"
+        f"🛡 Ваша роль: <b>{label}</b>\n\n"
+        "🌐 <b>Единая панель управления</b>\n"
+        "Все рабочие инструменты доступны на сайте: график, заявки на выходные, "
+        "реферальные ссылки, статистика и управление командой.\n\n"
+        "🔐 Для входа нажмите <b>«Войти через Telegram»</b> на сайте.\n\n"
+        "🛜 <b>Сайт не открывается?</b> Попробуйте включить VPN, "
+        "обновить страницу и повторить вход.\n\n"
+        "💙 <i>Shinobi Team — одна команда, одна система.</i>",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    if base:
+        await message.answer(
+            "👇 <b>Открыть панель управления</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🌐 Открыть Shinobi Team Hub", url=base)]
+            ]),
+        )
+    else:
+        await message.answer(
+            "⚠️ Адрес панели пока не настроен. Укажите HUB_PUBLIC_URL "
+            "(HTTPS-адрес сайта) в переменных Railway."
+        )
 
 
 @dp.message(F.text == "📋 Мой график")
@@ -5339,7 +5369,8 @@ async def main():
     asyncio.create_task(staff_random_reply_loop())
     asyncio.create_task(server_tag_cleanup_loop())
     asyncio.create_task(chat_summary_broadcast_loop())
-    asyncio.create_task(october_content_reminder_loop())
+    # Напоминания контент-плана в ЛС отключены по запросу владельца.
+    # asyncio.create_task(october_content_reminder_loop())
 
     await dp.start_polling(
         bot,
