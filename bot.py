@@ -3184,7 +3184,7 @@ async def join_request_handler(event: ChatJoinRequest):
     # A previous successful API response does not prove the Staff message still exists.
     # Do not overwrite pending request or its messages on duplicate updates.
     if existing and existing.get("status") == "pending":
-        from datetime import datetime, timedelta
+        # Используем глобально импортированный datetime; локальный импорт ломал новые заявки.
         last = existing.get("staff_retry_at")
         try:
             too_soon = last and (datetime.now() - datetime.fromisoformat(last)).total_seconds() < 60
