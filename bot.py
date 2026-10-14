@@ -3181,12 +3181,34 @@ async def join_request_handler(event: ChatJoinRequest):
         return
     key = _join_request_key(event.chat.id, event.from_user.id)
     existing = data.setdefault("pending_join_requests", {}).get(key)
-    # Telegram/несколько update-путей могут прислать одно событие повторно.
-    # Пока заявка активна, второй комплект карточек НЕ создаём.
-    if existing and existing.get("status") == "pending" and any(m.get("place") == "staff" for m in (existing.get("messages") or [])):
-        logging.getLogger("shinobi.join").warning("[JOIN REQUEST DUPLICATE] user=%s already delivered", event.from_user.id)
+    # A previous successful API response does not prove the Staff message still exists.
+    # Do not overwrite pending request or its messages on duplicate updates.
+    if existing and existing.get("status") == "pending":
+        from datetime import datetime, timedelta
+        last = existing.get("staff_retry_at")
+        try:
+            too_soon = last and (datetime.now() - datetime.fromisoformat(last)).total_seconds() < 60
+        except (ValueError, TypeError):
+            too_soon = False
+        if too_soon:
+            logging.getLogger("shinobi.join").warning("[JOIN REQUEST RETRY THROTTLED] user=%s", event.from_user.id)
+            return
+        existing["staff_retry_at"] = datetime.now().isoformat()
+        save_data()
+        try:
+            msg = await bot.send_message(
+                ADMIN_STAFF_CHAT_ID,
+                _join_request_text(existing),
+                reply_markup=_join_request_keyboard(event.chat.id, event.from_user.id),
+                parse_mode="HTML",
+            )
+            existing.setdefault("messages", []).append({"chat_id": ADMIN_STAFF_CHAT_ID, "message_id": msg.message_id, "place": "staff"})
+            logging.getLogger("shinobi.join").warning("[JOIN REQUEST STAFF RESENT] chat=%s user=%s message=%s", ADMIN_STAFF_CHAT_ID, event.from_user.id, msg.message_id)
+        except Exception as exc:
+            logging.getLogger("shinobi.join").exception("[JOIN REQUEST STAFF RESEND FAILED] user=%s", event.from_user.id)
+            existing.setdefault("delivery_errors", []).append(f"staff retry: {exc}")
+        save_data()
         return
-    # Если старая заявка была сохранена, но уведомление не дошло — отправляем повторно.
 
     invite_url = event.invite_link.invite_link if event.invite_link else ""
     link_info = data.get("links", {}).get(invite_url, {})
@@ -3256,6 +3278,35 @@ async def join_request_handler(event: ChatJoinRequest):
     for admin_id in sorted(set(ADMIN_IDS)):
         await _deliver(admin_id, "dm")
     save_data()
+
+
+@dp.message(Command("resend_join"))
+async def resend_join_command(message: Message):
+    """Owner: /resend_join <user_id> to re-send stored pending request to Staff."""
+    if message.from_user.id not in OWNER_IDS:
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Использование: /resend_join 8714004313")
+        return
+    user_id = int(parts[1])
+    req = data.get("pending_join_requests", {}).get(_join_request_key(CHAT_ID, user_id))
+    if not req:
+        await message.answer("Заявка не найдена в базе.")
+        return
+    if req.get("status") != "pending":
+        await message.answer(f"Заявка уже обработана: {req.get('status')}")
+        return
+    try:
+        sent = await bot.send_message(ADMIN_STAFF_CHAT_ID, _join_request_text(req), reply_markup=_join_request_keyboard(CHAT_ID, user_id), parse_mode="HTML")
+        req.setdefault("messages", []).append({"chat_id": ADMIN_STAFF_CHAT_ID, "message_id": sent.message_id, "place": "staff"})
+        req["staff_retry_at"] = datetime.now().isoformat()
+        save_data()
+        logging.getLogger("shinobi.join").warning("[JOIN REQUEST STAFF RESENT] chat=%s user=%s message=%s manual=1", ADMIN_STAFF_CHAT_ID, user_id, sent.message_id)
+        await message.answer(f"Заявка отправлена в Staff: сообщение {sent.message_id}.")
+    except Exception as exc:
+        logging.getLogger("shinobi.join").exception("[JOIN REQUEST STAFF RESEND FAILED] user=%s", user_id)
+        await message.answer(f"Ошибка отправки в Staff: {exc}")
 
 
 @dp.callback_query(F.data.startswith("jr_accept:") | F.data.startswith("jr_decline:"))
