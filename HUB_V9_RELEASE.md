@@ -1,0 +1,2 @@
+# V9: Atomic Telegram schedule edits
+Telegram administrator schedule callbacks (toggle duty/day off, clear day, change hours, set 24/7, delete) and initial Telegram schedule assignment now mutate the same PostgreSQL record under `SELECT ... FOR UPDATE` as website edits. The website's compare-and-swap remains active. Avoids lost updates between Telegram and website schedule edits. Excel working-hour schedules and timezone JSON are still separate and not part of this atomic transaction. Test on staging with a backup before production.

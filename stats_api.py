@@ -193,6 +193,8 @@ WRITE_ROLES = {
     "/api/backup/full": {"owner"},
     "/api/system/version": {"owner"},
     "/api/october-plan": {"owner", "deputy"},
+    "/api/hub/schedule-live": {"owner", "deputy"},
+    "/api/hub/dayoff-review": {"owner", "deputy"},
 }
 
 @web.middleware
@@ -213,9 +215,18 @@ async def auth_middleware(request, handler):
     if request.path.startswith('/api/backup') or request.path.startswith('/api/market/wallets'):
         if not session or session['role'] != 'owner':
             return web.json_response({"error":"forbidden"},status=403)
-    if request.path in ('/api/login-audit','/api/revoke-user','/api/staff','/api/staff/role'):
+    if request.path in ('/api/login-audit','/api/revoke-user','/api/staff','/api/staff/role','/api/sessions','/api/sessions/revoke-others'):
         if not session or session['role'] != 'owner':
             return web.json_response({"error":"forbidden"},status=403)
+    if request.method in ('POST', 'PUT', 'PATCH', 'DELETE') and request.path.startswith('/api/') and session:
+        try:
+            response = await handler(request)
+            status = getattr(response, 'status', 200)
+            hub_auth.audit(session['uid'], 'api_' + request.method.lower() + '_' + request.path.replace('/', '_') + '_status_' + str(status))
+            return response
+        except Exception:
+            hub_auth.audit(session['uid'], 'api_' + request.method.lower() + '_' + request.path.replace('/', '_') + '_error')
+            raise
     return await handler(request)
 
 SETTINGS_FILE = BASE_DIR / "project_settings.json"
@@ -475,9 +486,21 @@ input,select,textarea{border-radius:11px!important;min-height:38px}.tab{font-wei
 #hub-toast-stack{position:fixed;right:22px;bottom:22px;z-index:9999;display:flex;flex-direction:column;gap:10px;pointer-events:none}.hub-toast{padding:13px 17px;background:rgba(255,255,255,.95);border:1px solid #c8e6f6;border-radius:14px;color:#235576;box-shadow:0 14px 36px #286c9a2c;backdrop-filter:blur(15px);font-size:13px;font-weight:650;max-width:340px;animation:hub-toast-in .25s ease both}.hub-toast.error{border-color:#ffd3d3;color:#a34343}@keyframes hub-toast-in{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}
 @media(max-width:900px){.topnav{top:76px!important}header{padding:0 14px!important}main{padding:20px 14px 60px!important}}@media(max-width:550px){.title{font-size:28px!important}.hero{min-height:160px!important}.infoCard{padding:15px!important}.topnav{width:min(290px,86vw)!important}}
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.01ms!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
-</style></head><body><header><button type="button" class="hub-menu-toggle" aria-label="Открыть разделы" aria-expanded="false" onclick="toggleHubMenu()">☰</button><div class="brand">SHINOBI <span>STATS</span></div><div class="who"><b>__ROLE__</b> • AUTHORIZED <a class="logout" href="/logout">Выйти</a></div></header><div class="hub-overlay" onclick="closeHubMenu()"></div><main><div class="eyebrow">SHINOBI TEAM • INTERNAL SYSTEM</div><div class="title">Контроль сотрудников</div><div class="muted">Отчёты и архив администрации проекта • BUILD 2026.09.27.2</div><div class="topnav"><button class="navbtn active" onclick="showPage('hubOverview',this);hubOverviewLoad()">Обзор</button><button class="navbtn" onclick="showPage('hubStaff',this);hubStaffLoad()">Сотрудники</button><button class="navbtn active" onclick="showPage('reportsPage',this)">📊 Отчёты</button><button class="navbtn" onclick="showPage('projectPage',this)">🥷 О проекте</button><button class="navbtn" onclick="showPage('botPage',this)">🤖 О боте</button><button class="navbtn" onclick="showPage('controlPage',this);loadControl()">🎛 Управление</button><button class="navbtn" onclick="showPage('changesPage',this);loadChanges()">🗓 История изменений</button><button class="navbtn" onclick="showPage('chatPage',this);loadChatSummary()">💬 Сводка чатов</button><button class="navbtn" onclick="showPage('growthPage',this);loadGrowth()">📈 Приглашения и рост</button>__TECH_NAV__<button class="navbtn" onclick="showPage('aiModPage',this);loadAiModeration()">🧪 AI-модерация <b>BETA</b></button></div><div id="aiModPage" class="page"><div class="hero"><div class="eyebrow">AI MODERATION • BETA</div><h2>🧪 Журнал модерации <span style="font-size:15px;border:1px solid #e50914;padding:4px 8px;border-radius:8px">BETA</span></h2><div class="muted">AI и ручные наказания Staff в единой системе Shinobi Moderation.</div></div><div class="infoGrid"><div class="infoCard"><div class="infoLabel">СРАБАТЫВАНИЙ В ЖУРНАЛЕ</div><div class="infoValue" id="aiModCount">—</div></div><div class="infoCard"><div class="infoLabel">СТАТУС</div><div class="infoValue">🧪 BETA</div></div></div><div class="mediaTools"><h3>🛡 Последние нарушения • BETA</h3><div class="status" style="margin-bottom:12px">Показываются последние 500 применённых решений AI-модерации.</div><div id="aiModLog"><div class="empty">Загрузка…</div></div></div></div><div id="growthPage" class="page"><div class="hero"><div class="eyebrow">SHINOBI ANALYTICS</div><h2>📈 Приглашения и рост чата</h2><div class="muted">Рейтинг реферальных ссылок, дневной прирост и история входов в основной чат.</div></div><div class="infoGrid"><div class="infoCard"><div class="infoLabel">ВОШЛО СЕГОДНЯ</div><div class="infoValue" id="joinsToday">—</div></div><div class="infoCard"><div class="infoLabel">ВОШЛО ВЧЕРА</div><div class="infoValue" id="joinsYesterday">—</div></div><div class="infoCard"><div class="infoLabel">ПРИРОСТ К ВЧЕРА</div><div class="infoValue" id="joinsDelta">—</div></div><div class="infoCard"><div class="infoLabel">ЗА 30 ДНЕЙ</div><div class="infoValue" id="joinsPeriod">—</div></div></div><div class="mediaTools"><h3>📊 График входов за 30 дней</h3><div style="height:340px"><canvas id="joinsChart"></canvas></div></div><div class="mediaTools"><h3>🏆 Ссылки по количеству приглашённых</h3><div class="status" style="margin-bottom:12px">Сортировка от большего к меньшему. Персональную ссылку можно удалить прямо здесь.</div><div id="referralRanking"><div class="empty">Загрузка…</div></div></div></div><div id="octoberPage" class="page"><div class="hero"><div class="eyebrow">TECH ADMIN • OCTOBER 2026</div><h2>📅 План на октябрь</h2><div class="muted">31 день контента MLBB. Отмечай выполненные публикации галочкой.</div></div><div class="panel"><div class="ph">Контент-план • Октябрь 2026</div><div id="octoberPlanBox"><div class="empty">Загрузка…</div></div></div></div><section class="page active" id="hubOverview"><div class="eyebrow">SHINOBI TEAM / CONTROL CENTER</div><h1 class="title">Панель управления</h1><p class="muted">Живые данные из существующих модулей Shinobi Team Hub</p><div class="infoGrid" id="hubOverviewStats"><div class="infoCard">Загружаем показатели…</div></div><div class="hub-feature-grid"><div class="panel"><div class="ph">Быстрые действия</div><div class="hub-quick"><button class="btn" onclick="hubGo('growthPage')">Приглашения</button><button class="btn" onclick="hubGo('controlPage')">Управление ботом</button><button class="btn" onclick="hubGo('chatPage')">Сводка чатов</button><button class="btn" onclick="hubGo('reportsPage')">Отчёты</button></div></div><div class="panel"><div class="ph">Безопасность</div><div class="hub-quick"><p class="muted">Авторизация через Telegram, роли на сервере, выход после 30 минут бездействия.</p><a class="btn" href="/logout" style="text-decoration:none;display:inline-block">Завершить сессию</a></div></div></div></section>
-<section class="page" id="hubStaff"><div class="eyebrow">КОМАНДА / ДОСТУП</div><h1 class="title">Сотрудники</h1><p class="muted">Владелец может назначать роли, отключать доступ и завершать активные сессии. Изменения сохраняются в PostgreSQL.</p><div class="panel"><div class="ph">Добавить или изменить сотрудника</div><div class="hub-quick"><div class="mediaRow"><input id="hubStaffUid" inputmode="numeric" placeholder="Telegram ID сотрудника"><select id="hubStaffRole"><option value="moderator">Модератор</option><option value="admin">Администратор</option><option value="deputy">Заместитель</option><option value="disabled">Отключить доступ</option></select><button class="btn" onclick="hubStaffSave()">Сохранить</button></div><div id="hubStaffMsg" class="status"></div></div></div><div class="panel" style="margin-top:18px"><div class="ph">Список сотрудников</div><div id="hubStaffRows" class="tablewrap"><div class="empty">Загрузка…</div></div></div></section>
-<div id="reportsPage" class="page active"><div class="toolbar"><button class="btn" id="newReportBtn" onclick="createNewReport()">＋ Новый отчёт</button><button class="btn" onclick="loadReports()">↻ Обновить архив</button><span class="status" id="status">Готово</span></div><div class="grid"><section class="panel"><div class="ph">Архив отчётов</div><div class="reports" id="reports"><div class="empty">Загрузка…</div></div></section><section class="panel content"><div class="ph" id="reportTitle">Выберите отчёт</div><div class="tabs" id="tabs"></div><div class="tablewrap" id="table"><div class="empty">Выберите отчёт слева</div></div></section></div></div><div id="projectPage" class="page"><div class="hero"><div class="eyebrow">SHINOBI TEAM</div><h2>О проекте</h2><div class="muted">Внутренняя система управления, отчётности и контроля Shinobi Team.</div></div><div class="infoGrid"><div class="infoCard"><div class="infoLabel">ПРОЕКТ</div><div class="infoValue" id="projectName">Shinobi Team</div></div><div class="infoCard"><div class="infoLabel">ПЛАТФОРМА</div><div class="infoValue" id="platform">MLBB</div></div><div class="infoCard"><div class="infoLabel">СРЕДА</div><div class="infoValue" id="environment">PRODUCTION</div></div><div class="infoCard"><div class="infoLabel">БАЗА ДАННЫХ</div><div class="infoValue" id="database">—</div></div></div><div id="mediaEditor"></div></div><div id="botPage" class="page"><div class="hero"><div class="eyebrow">SHINOBI SYSTEM</div><h2>О боте</h2><div class="muted">Техническая информация о текущей версии Telegram-бота.</div></div><div class="infoGrid"><div class="infoCard"><div class="infoLabel">BOT STATUS</div><div class="infoValue" style="color:#43d17a" id="botStatus">● ONLINE</div></div><div class="infoCard"><div class="infoLabel">BOT VERSION</div><div class="infoValue" id="botVersion">—</div><div id="versionEditor"></div></div><div class="infoCard"><div class="infoLabel">DATABASE</div><div class="infoValue" id="botDatabase">—</div></div><div class="infoCard"><div class="infoLabel">ACCESS ROLE</div><div class="infoValue">__ROLE__</div></div></div></div><div id="controlPage" class="page"><div class="hero"><div class="eyebrow">TELEGRAM WEB APP</div><h2>Управление ботом</h2><div class="muted">Состояние Telegram-функций, группы, пользователи и серверные теги.</div></div><div class="infoGrid"><div class="infoCard"><div class="infoLabel">ПОЛЬЗОВАТЕЛЕЙ</div><div class="infoValue" id="ctlUsers">—</div></div><div class="infoCard"><div class="infoLabel">ГРУПП</div><div class="infoValue" id="ctlGroups">—</div></div><div class="infoCard"><div class="infoLabel">ВЫДАНО ТЕГОВ</div><div class="infoValue" id="ctlTags">—</div></div><div class="infoCard"><div class="infoLabel">ТЕХ. РАБОТЫ</div><div class="infoValue" id="ctlMaint">—</div></div></div><div class="mediaTools"><h3>🎲 Автоматические реакции</h3><div class="status">Мгновенные случайные реакции на новые сообщения в основном чате. Переключение применяется без перезапуска бота (до 2 секунд).</div><div class="mediaRow" style="margin-top:12px"><button class="btn" id="autoReactionsToggle" onclick="toggleAutoReactions()">Загрузка…</button><span class="status" id="autoReactionsState"></span></div></div><div class="mediaTools"><h3>⚡ Автовыдача серверных тегов</h3><div class="status">Если выключено, бот не спрашивает сервер у новых участников, не реагирует на ответы и реакции для выдачи тегов.</div><div class="mediaRow" style="margin-top:12px"><button class="btn" id="serverTagsToggle" onclick="toggleServerTags()">Загрузка…</button><span class="status" id="serverTagsState"></span></div></div><div class="mediaTools"><h3>🏷 Серверные теги</h3><div class="status">Ручная выдача использует Telegram setChatMemberTag. Боту нужно право can_manage_tags.</div><div class="mediaRow" style="margin-top:12px"><input id="tagChat" placeholder="Chat ID"><input id="tagUser" placeholder="User ID"><select id="tagValue" style="background:#0d0d0f;color:#fff;border:1px solid #333;padding:11px;border-radius:8px"></select><button class="btn" onclick="assignTagWeb()">Выдать тег</button></div><div class="status" id="tagStatus" style="margin-top:10px">Готово</div><div id="tagHistory" style="margin-top:14px;overflow:auto"></div></div><div class="mediaTools"><h3>👤 Участники без тега</h3><div class="status">Проверяет участников ОСНОВНОГО чата, которых бот уже знает. Администраторы исключаются автоматически — их специальные теги не учитываются. Telegram Bot API не отдаёт боту полный список всех участников группы.</div><div class="mediaRow" style="margin-top:12px"><button class="btn" onclick="loadUntagged()">Обновить список</button><button class="navbtn" onclick="copyUntagged()">Копировать</button><span class="status" id="untaggedStatus">Нажмите «Обновить список»</span></div><textarea id="untaggedList" readonly style="width:100%;min-height:180px;margin-top:12px;background:#0b0b0d;color:#eee;border:1px solid #333;border-radius:8px;padding:12px;resize:vertical"></textarea></div><div class="mediaTools"><h3>💾 Полный бэкап бота</h3><div class="status">Собирает ZIP в момент запроса: актуальные файлы бота, локальные данные, отчёты, медиа и полный экспорт PostgreSQL. Для скачивания требуется отдельный резервный код.</div><div class="mediaRow" style="margin-top:12px"><button class="btn" id="backupBtn" onclick="downloadFullBackup()">Скачать актуальную версию</button><span class="status" id="backupStatus">Готово</span></div></div><div class="mediaTools" id="marketWalletPanel"><h3>💎 Монеты Чёрного рынка</h3><div class="status">Доступно владельцу и тех. админу. Выбери игрока и добавь ему виртуальные монеты либо установи точный баланс.</div><div class="mediaRow" style="margin-top:12px"><select id="marketPlayer" style="min-width:320px;background:#0d0d0f;color:#fff;border:1px solid #333;padding:11px;border-radius:8px"></select><input id="marketAmount" type="number" min="0" placeholder="Количество монет"><select id="marketMode" style="background:#0d0d0f;color:#fff;border:1px solid #333;padding:11px;border-radius:8px"><option value="add">Добавить к балансу</option><option value="set">Установить баланс</option></select><button class="btn" onclick="updateMarketWallet()">Применить</button></div><div class="status" id="marketWalletStatus" style="margin-top:10px">Загрузка игроков…</div></div><div class="mediaTools"><h3>🏘 Группы и доступ к командам</h3><div class="status" style="margin-bottom:10px">Переключатель действует на все команды бота, включая игровые. Новые группы по умолчанию получают доступ.</div><div id="ctlGroupList" class="status">Загрузка…</div></div><div class="mediaTools"><h3>👥 Пользователи бота</h3><div id="ctlUserList" class="status">Загрузка…</div></div></div><div id="changesPage" class="page"><div class="hero"><div class="eyebrow">SHINOBI CHANGELOG</div><h2>История изменений</h2><div class="muted">Что менялось в боте и веб-панели — по датам.</div></div><div id="changesList"><div class="empty">Загрузка…</div></div></div><div id="chatPage" class="page"><div class="hero"><div class="eyebrow">LIVE CHAT ANALYTICS</div><h2>Сводка чатов</h2><div class="muted">Статистика собирается ботом отдельно для каждого установленного чата.</div></div><div id="chatSummaryBox" class="infoGrid"><div class="empty">Загрузка…</div></div><div class="status" style="margin-top:14px">🟢 «Активны» = уникальные пользователи, от которых бот видел сообщения за последние 15 минут. Telegram Bot API не предоставляет точный список online-пользователей группы.</div></div></main><script>
+
+/* V4 — searchable glass data workspaces */
+.hub-table-toolbar{display:flex;flex-wrap:wrap;align-items:end;gap:12px;margin:14px 0 18px;padding:15px;background:rgba(232,247,255,.65);border:1px solid rgba(162,208,235,.5);border-radius:17px}
+.hub-search-label{flex:1 1 230px;display:flex;flex-direction:column;gap:6px;color:#497995;font-size:12px;font-weight:750}
+.hub-search-label input{width:100%;background:#fff!important;border:1px solid #cde5f5!important;padding:12px 14px;min-height:43px}
+.hub-secondary{background:rgba(255,255,255,.9)!important;color:#1d80b8!important;border:1px solid #b9e0f5!important;box-shadow:none!important}
+.hub-secondary:hover{background:#e4f4ff!important}
+.hub-filter-hidden{display:none!important}
+#growthPage .mediaTools,#aiModPage .mediaTools{overflow-x:auto}
+#growthPage td,#aiModPage td{vertical-align:middle}
+#growthPage tbody tr,#aiModPage tbody tr{transition:background .16s ease}
+@media(max-width:650px){.hub-table-toolbar{padding:12px}.hub-table-toolbar button{flex:1 1 120px}}
+</style></head><body><header><button type="button" class="hub-menu-toggle" aria-label="Открыть разделы" aria-expanded="false" onclick="toggleHubMenu()">☰</button><div class="brand">SHINOBI <span>STATS</span></div><div class="who"><b>__ROLE__</b> • AUTHORIZED <a class="logout" href="/logout">Выйти</a></div></header><div class="hub-overlay" onclick="closeHubMenu()"></div><main><div class="eyebrow">SHINOBI TEAM • INTERNAL SYSTEM</div><div class="title">Контроль сотрудников</div><div class="muted">Отчёты и архив администрации проекта • BUILD 2026.09.27.2</div><div class="topnav"><button class="navbtn active" onclick="showPage('hubOverview',this);hubOverviewLoad()">Обзор</button><button class="navbtn" onclick="showPage('hubStaff',this);hubStaffLoad()">Сотрудники</button><button class="navbtn" onclick="showPage('hubSecurity',this);hubSecurityLoad()">Безопасность</button><button class="navbtn" onclick="showPage('hubSchedule',this);hubScheduleLoad();hubLiveLoad();hubDayoffLoad()">График и выходные</button><button class="navbtn active" onclick="showPage('reportsPage',this)">📊 Отчёты</button><button class="navbtn" onclick="showPage('projectPage',this)">🥷 О проекте</button><button class="navbtn" onclick="showPage('botPage',this)">🤖 О боте</button><button class="navbtn" onclick="showPage('controlPage',this);loadControl()">🎛 Управление</button><button class="navbtn" onclick="showPage('changesPage',this);loadChanges()">🗓 История изменений</button><button class="navbtn" onclick="showPage('chatPage',this);loadChatSummary()">💬 Сводка чатов</button><button class="navbtn" onclick="showPage('growthPage',this);loadGrowth()">📈 Приглашения и рост</button>__TECH_NAV__<button class="navbtn" onclick="showPage('aiModPage',this);loadAiModeration()">🧪 AI-модерация <b>BETA</b></button></div><div id="aiModPage" class="page"><div class="hero"><div class="eyebrow">AI MODERATION • BETA</div><h2>🧪 Журнал модерации <span style="font-size:15px;border:1px solid #e50914;padding:4px 8px;border-radius:8px">BETA</span></h2><div class="muted">AI и ручные наказания Staff в единой системе Shinobi Moderation.</div></div><div class="infoGrid"><div class="infoCard"><div class="infoLabel">СРАБАТЫВАНИЙ В ЖУРНАЛЕ</div><div class="infoValue" id="aiModCount">—</div></div><div class="infoCard"><div class="infoLabel">СТАТУС</div><div class="infoValue">🧪 BETA</div></div></div><div class="mediaTools"><h3>🛡 Последние нарушения • BETA</h3><div class="status" style="margin-bottom:12px">Показываются последние 500 применённых решений AI-модерации.</div><div class="hub-table-toolbar"><label class="hub-search-label">Поиск по нарушениям <input id="hubModFilter" type="search" placeholder="Участник, правило, причина" oninput="hubFilterTable('aiModLog',this.value)"></label><button class="btn hub-secondary" onclick="hubExportTable('aiModLog','shinobi-moderation.csv')">Экспорт CSV</button><button class="btn hub-secondary" onclick="loadAiModeration()">Обновить</button></div><div id="aiModLog"><div class="empty">Загрузка…</div></div></div></div><div id="growthPage" class="page"><div class="hero"><div class="eyebrow">SHINOBI ANALYTICS</div><h2>📈 Приглашения и рост чата</h2><div class="muted">Рейтинг реферальных ссылок, дневной прирост и история входов в основной чат.</div></div><div class="infoGrid"><div class="infoCard"><div class="infoLabel">ВОШЛО СЕГОДНЯ</div><div class="infoValue" id="joinsToday">—</div></div><div class="infoCard"><div class="infoLabel">ВОШЛО ВЧЕРА</div><div class="infoValue" id="joinsYesterday">—</div></div><div class="infoCard"><div class="infoLabel">ПРИРОСТ К ВЧЕРА</div><div class="infoValue" id="joinsDelta">—</div></div><div class="infoCard"><div class="infoLabel">ЗА 30 ДНЕЙ</div><div class="infoValue" id="joinsPeriod">—</div></div></div><div class="mediaTools"><h3>📊 График входов за 30 дней</h3><div style="height:340px"><canvas id="joinsChart"></canvas></div></div><div class="mediaTools"><h3>🏆 Ссылки по количеству приглашённых</h3><div class="status" style="margin-bottom:12px">Сортировка от большего к меньшему. Персональную ссылку можно удалить прямо здесь.</div><div class="hub-table-toolbar"><label class="hub-search-label">Поиск по ссылкам <input id="hubReferralFilter" type="search" placeholder="Имя, @username или ссылка" oninput="hubFilterTable('referralRanking',this.value)"></label><button class="btn hub-secondary" onclick="hubExportTable('referralRanking','shinobi-referrals.csv')">Экспорт CSV</button><button class="btn hub-secondary" onclick="loadGrowth()">Обновить</button></div><div id="referralRanking"><div class="empty">Загрузка…</div></div></div></div><div id="octoberPage" class="page"><div class="hero"><div class="eyebrow">TECH ADMIN • OCTOBER 2026</div><h2>📅 План на октябрь</h2><div class="muted">31 день контента MLBB. Отмечай выполненные публикации галочкой.</div></div><div class="panel"><div class="ph">Контент-план • Октябрь 2026</div><div id="octoberPlanBox"><div class="empty">Загрузка…</div></div></div></div><section class="page active" id="hubOverview"><div class="eyebrow">SHINOBI TEAM / CONTROL CENTER</div><h1 class="title">Панель управления</h1><p class="muted">Живые данные из существующих модулей Shinobi Team Hub</p><div class="infoGrid" id="hubOverviewStats"><div class="infoCard">Загружаем показатели…</div></div><div class="hub-feature-grid"><div class="panel"><div class="ph">Быстрые действия</div><div class="hub-quick"><button class="btn" onclick="hubGo('growthPage')">Приглашения</button><button class="btn" onclick="hubGo('controlPage')">Управление ботом</button><button class="btn" onclick="hubGo('chatPage')">Сводка чатов</button><button class="btn" onclick="hubGo('reportsPage')">Отчёты и графики</button></div></div><div class="panel"><div class="ph">Безопасность</div><div class="hub-quick"><p class="muted">Авторизация через Telegram, роли на сервере, выход после 30 минут бездействия.</p><a class="btn" href="/logout" style="text-decoration:none;display:inline-block">Завершить сессию</a></div></div></div></section>
+<section class="page" id="hubSecurity"><div class="eyebrow">SECURITY CENTER</div><h1 class="title">Безопасность и сессии</h1><p class="muted">Только владелец. История авторизации и активные сессии сотрудников.</p><div class="infoGrid"><div class="infoCard"><div class="infoLabel">СЕССИИ</div><div class="infoValue" id="hubSessionCount">—</div></div><div class="infoCard"><div class="infoLabel">СОБЫТИЯ АВТОРИЗАЦИИ</div><div class="infoValue" id="hubAuditCount">—</div></div></div><div class="mediaTools"><h3>Активные сессии</h3><p class="status">Сессии автоматически истекают после 30 минут бездействия, максимум через 12 часов. Завершение сессии не выходит из Telegram.</p><div class="mediaRow"><button class="btn" onclick="hubSecurityLoad()">Обновить</button><button class="navbtn" onclick="hubRevokeAll()">Завершить все чужие сессии</button></div><div class="tablewrap" id="hubSessionRows" style="margin-top:16px">Загрузка…</div></div><div class="mediaTools"><h3>Журнал входов</h3><div class="mediaRow"><input id="hubAuditSearch" placeholder="Поиск по ID или событию" oninput="hubRenderAudit()" aria-label="Поиск в журнале"></div><div class="tablewrap" id="hubAuditRows" style="margin-top:16px">Загрузка…</div></div></section><section class="page" id="hubStaff"><div class="eyebrow">КОМАНДА / ДОСТУП</div><h1 class="title">Сотрудники</h1><p class="muted">Владелец может назначать роли, отключать доступ и завершать активные сессии. Изменения сохраняются в PostgreSQL.</p><div class="panel"><div class="ph">Добавить или изменить сотрудника</div><div class="hub-quick"><div class="mediaRow"><input id="hubStaffUid" inputmode="numeric" placeholder="Telegram ID сотрудника"><select id="hubStaffRole"><option value="moderator">Модератор</option><option value="admin">Администратор</option><option value="deputy">Заместитель</option><option value="disabled">Отключить доступ</option></select><button class="btn" onclick="hubStaffSave()">Сохранить</button></div><div id="hubStaffMsg" class="status"></div></div></div><div class="panel" style="margin-top:18px"><div class="ph">Список сотрудников</div><div id="hubStaffRows" class="tablewrap"><div class="empty">Загрузка…</div></div></div></section>
+<section class="page" id="hubSchedule"><div class="eyebrow">STAFF OPERATIONS</div><h1 class="title">График и выходные</h1><p class="muted">Живой график и заявки из общей PostgreSQL. Ниже также доступен архив XLSX-снимков для отчётности.</p><div class="infoGrid"><div class="infoCard"><div class="infoLabel">ЗАПИСЕЙ ГРАФИКА</div><div class="infoValue" id="hubScheduleCount">—</div></div><div class="infoCard"><div class="infoLabel">ЗАЯВОК НА ВЫХОДНОЙ</div><div class="infoValue" id="hubDaysOffCount">—</div></div></div><div class="panel" style="margin-top:18px"><div class="ph">Живой график обязанностей · PostgreSQL</div><p class="muted">Изменения сохраняются в общей базе и используются Telegram-ботом. Редактирование доступно владельцу и заместителю.</p><div class="mediaRow"><select id="hubLiveUser" onchange="hubLiveRender()" aria-label="Сотрудник"></select><select id="hubLiveDay" onchange="hubLiveRender()" aria-label="День недели"></select><label><input type="checkbox" id="hubLiveOff"> Выходной</label></div><div id="hubLiveDuties" class="hub-feature-grid" style="margin:12px 0"></div><div class="mediaRow"><button class="btn" onclick="hubLiveSave()">Сохранить график</button><button class="btn hub-secondary" onclick="hubLiveLoad()">Обновить данные</button></div><p class="status" id="hubLiveStatus"></p></div><div class="panel" style="margin-top:18px"><div class="ph">График сотрудников</div><div class="hub-table-toolbar"><label class="hub-search-label">Поиск по сотруднику или дню<input id="hubScheduleFilter" placeholder="Имя, ID, день недели…" oninput="hubFilterTable('hubScheduleRows',this.value)"></label><button class="btn hub-secondary" onclick="hubScheduleLoad()">Обновить</button><button class="btn hub-secondary" onclick="hubExportTable('hubScheduleRows','shinobi-schedule.csv')">Экспорт CSV</button></div><div id="hubScheduleRows" class="tablewrap"><div class="empty">Откройте раздел для загрузки</div></div></div><div class="panel" style="margin-top:18px"><div class="ph">Рассмотрение заявок · PostgreSQL</div><p class="muted">Одобрение или отклонение доступно владельцу и заместителю. Повторное решение по одной заявке блокируется.</p><div class="mediaRow"><button class="btn hub-secondary" onclick="hubDayoffLoad()">Обновить заявки</button></div><div id="hubDayoffReviewRows" class="tablewrap"><div class="empty">Нажмите «Обновить заявки»</div></div><p id="hubDayoffReviewStatus" class="status"></p></div><div class="panel" style="margin-top:18px"><div class="ph">Заявки на выходные</div><div class="hub-table-toolbar"><label class="hub-search-label">Поиск по заявкам<input id="hubDaysOffFilter" placeholder="Имя, статус, дата…" oninput="hubFilterTable('hubDaysOffRows',this.value)"></label><button class="btn hub-secondary" onclick="hubExportTable('hubDaysOffRows','shinobi-days-off.csv')">Экспорт CSV</button></div><div id="hubDaysOffRows" class="tablewrap"><div class="empty">Откройте раздел для загрузки</div></div></div><p class="status" id="hubScheduleUpdated"></p></section><div id="reportsPage" class="page active"><div class="toolbar"><button class="btn" id="newReportBtn" onclick="createNewReport()">＋ Новый отчёт</button><button class="btn" onclick="loadReports()">↻ Обновить архив</button><span class="status" id="status">Готово</span></div><div class="grid"><section class="panel"><div class="ph">Архив отчётов</div><div class="reports" id="reports"><div class="empty">Загрузка…</div></div></section><section class="panel content"><div class="ph" id="reportTitle">Выберите отчёт</div><div class="tabs" id="tabs"></div><div class="tablewrap" id="table"><div class="empty">Выберите отчёт слева</div></div></section></div></div><div id="projectPage" class="page"><div class="hero"><div class="eyebrow">SHINOBI TEAM</div><h2>О проекте</h2><div class="muted">Внутренняя система управления, отчётности и контроля Shinobi Team.</div></div><div class="infoGrid"><div class="infoCard"><div class="infoLabel">ПРОЕКТ</div><div class="infoValue" id="projectName">Shinobi Team</div></div><div class="infoCard"><div class="infoLabel">ПЛАТФОРМА</div><div class="infoValue" id="platform">MLBB</div></div><div class="infoCard"><div class="infoLabel">СРЕДА</div><div class="infoValue" id="environment">PRODUCTION</div></div><div class="infoCard"><div class="infoLabel">БАЗА ДАННЫХ</div><div class="infoValue" id="database">—</div></div></div><div id="mediaEditor"></div></div><div id="botPage" class="page"><div class="hero"><div class="eyebrow">SHINOBI SYSTEM</div><h2>О боте</h2><div class="muted">Техническая информация о текущей версии Telegram-бота.</div></div><div class="infoGrid"><div class="infoCard"><div class="infoLabel">BOT STATUS</div><div class="infoValue" style="color:#43d17a" id="botStatus">● ONLINE</div></div><div class="infoCard"><div class="infoLabel">BOT VERSION</div><div class="infoValue" id="botVersion">—</div><div id="versionEditor"></div></div><div class="infoCard"><div class="infoLabel">DATABASE</div><div class="infoValue" id="botDatabase">—</div></div><div class="infoCard"><div class="infoLabel">ACCESS ROLE</div><div class="infoValue">__ROLE__</div></div></div></div><div id="controlPage" class="page"><div class="hero"><div class="eyebrow">TELEGRAM WEB APP</div><h2>Управление ботом</h2><div class="muted">Состояние Telegram-функций, группы, пользователи и серверные теги.</div></div><div class="infoGrid"><div class="infoCard"><div class="infoLabel">ПОЛЬЗОВАТЕЛЕЙ</div><div class="infoValue" id="ctlUsers">—</div></div><div class="infoCard"><div class="infoLabel">ГРУПП</div><div class="infoValue" id="ctlGroups">—</div></div><div class="infoCard"><div class="infoLabel">ВЫДАНО ТЕГОВ</div><div class="infoValue" id="ctlTags">—</div></div><div class="infoCard"><div class="infoLabel">ТЕХ. РАБОТЫ</div><div class="infoValue" id="ctlMaint">—</div></div></div><div class="mediaTools"><h3>🎲 Автоматические реакции</h3><div class="status">Мгновенные случайные реакции на новые сообщения в основном чате. Переключение применяется без перезапуска бота (до 2 секунд).</div><div class="mediaRow" style="margin-top:12px"><button class="btn" id="autoReactionsToggle" onclick="toggleAutoReactions()">Загрузка…</button><span class="status" id="autoReactionsState"></span></div></div><div class="mediaTools"><h3>⚡ Автовыдача серверных тегов</h3><div class="status">Если выключено, бот не спрашивает сервер у новых участников, не реагирует на ответы и реакции для выдачи тегов.</div><div class="mediaRow" style="margin-top:12px"><button class="btn" id="serverTagsToggle" onclick="toggleServerTags()">Загрузка…</button><span class="status" id="serverTagsState"></span></div></div><div class="mediaTools"><h3>🏷 Серверные теги</h3><div class="status">Ручная выдача использует Telegram setChatMemberTag. Боту нужно право can_manage_tags.</div><div class="mediaRow" style="margin-top:12px"><input id="tagChat" placeholder="Chat ID"><input id="tagUser" placeholder="User ID"><select id="tagValue" style="background:#0d0d0f;color:#fff;border:1px solid #333;padding:11px;border-radius:8px"></select><button class="btn" onclick="assignTagWeb()">Выдать тег</button></div><div class="status" id="tagStatus" style="margin-top:10px">Готово</div><div id="tagHistory" style="margin-top:14px;overflow:auto"></div></div><div class="mediaTools"><h3>👤 Участники без тега</h3><div class="status">Проверяет участников ОСНОВНОГО чата, которых бот уже знает. Администраторы исключаются автоматически — их специальные теги не учитываются. Telegram Bot API не отдаёт боту полный список всех участников группы.</div><div class="mediaRow" style="margin-top:12px"><button class="btn" onclick="loadUntagged()">Обновить список</button><button class="navbtn" onclick="copyUntagged()">Копировать</button><span class="status" id="untaggedStatus">Нажмите «Обновить список»</span></div><textarea id="untaggedList" readonly style="width:100%;min-height:180px;margin-top:12px;background:#0b0b0d;color:#eee;border:1px solid #333;border-radius:8px;padding:12px;resize:vertical"></textarea></div><div class="mediaTools"><h3>💾 Полный бэкап бота</h3><div class="status">Собирает ZIP в момент запроса: актуальные файлы бота, локальные данные, отчёты, медиа и полный экспорт PostgreSQL. Для скачивания требуется отдельный резервный код.</div><div class="mediaRow" style="margin-top:12px"><button class="btn" id="backupBtn" onclick="downloadFullBackup()">Скачать актуальную версию</button><span class="status" id="backupStatus">Готово</span></div></div><div class="mediaTools" id="marketWalletPanel"><h3>💎 Монеты Чёрного рынка</h3><div class="status">Доступно владельцу и тех. админу. Выбери игрока и добавь ему виртуальные монеты либо установи точный баланс.</div><div class="mediaRow" style="margin-top:12px"><select id="marketPlayer" style="min-width:320px;background:#0d0d0f;color:#fff;border:1px solid #333;padding:11px;border-radius:8px"></select><input id="marketAmount" type="number" min="0" placeholder="Количество монет"><select id="marketMode" style="background:#0d0d0f;color:#fff;border:1px solid #333;padding:11px;border-radius:8px"><option value="add">Добавить к балансу</option><option value="set">Установить баланс</option></select><button class="btn" onclick="updateMarketWallet()">Применить</button></div><div class="status" id="marketWalletStatus" style="margin-top:10px">Загрузка игроков…</div></div><div class="mediaTools"><h3>🏘 Группы и доступ к командам</h3><div class="status" style="margin-bottom:10px">Переключатель действует на все команды бота, включая игровые. Новые группы по умолчанию получают доступ.</div><div id="ctlGroupList" class="status">Загрузка…</div></div><div class="mediaTools"><h3>👥 Пользователи бота</h3><div id="ctlUserList" class="status">Загрузка…</div></div></div><div id="changesPage" class="page"><div class="hero"><div class="eyebrow">SHINOBI CHANGELOG</div><h2>История изменений</h2><div class="muted">Что менялось в боте и веб-панели — по датам.</div></div><div id="changesList"><div class="empty">Загрузка…</div></div></div><div id="chatPage" class="page"><div class="hero"><div class="eyebrow">LIVE CHAT ANALYTICS</div><h2>Сводка чатов</h2><div class="muted">Статистика собирается ботом отдельно для каждого установленного чата.</div></div><div id="chatSummaryBox" class="infoGrid"><div class="empty">Загрузка…</div></div><div class="status" style="margin-top:14px">🟢 «Активны» = уникальные пользователи, от которых бот видел сообщения за последние 15 минут. Telegram Bot API не предоставляет точный список online-пользователей группы.</div></div></main><script>
 let reports=[],current=null;const labels={'overview.json':'Обзор','shinobi_links_log.xlsx':'Результаты и приглашения','work_schedules.xlsx':'График сотрудников','day_off_requests.xlsx':'Заявки на выходные','data.json':'Полная база бота','admin_assignments.json':'Данные обязанностей','user_timezones.json':'Часовые пояса'};
 let sysInfo=null;function showPage(id,btn){document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));document.getElementById(id).classList.add('active');document.querySelectorAll('.navbtn').forEach(x=>x.classList.remove('active'));btn.classList.add('active');if(id!=='reportsPage')loadSystemInfo()}
 async function loadSystemInfo(){let r=await fetch('/api/system-info');if(!r.ok)return;sysInfo=await r.json();let s=sysInfo.settings||{};document.getElementById('projectName').textContent=s.project_name||'Shinobi Team';document.getElementById('platform').textContent=s.platform||'MLBB';document.getElementById('environment').textContent=s.environment||'PRODUCTION';document.getElementById('database').textContent=sysInfo.database_connected?'● PostgreSQL Connected':'Not configured';document.getElementById('botStatus').textContent='● '+(sysInfo.bot_status||'ONLINE');document.getElementById('botVersion').textContent=s.bot_version||'v1.0.0';document.getElementById('botDatabase').textContent=sysInfo.database||'—';let e=document.getElementById('versionEditor');e.innerHTML=sysInfo.role==='tech'?`<div class="editrow"><input id="newVersion" maxlength="64" value="${escapeHtml(s.bot_version||'v1.0.0')}" placeholder="Например v1920.20wsW"><button class="btn" onclick="saveVersion()">Сохранить</button></div><div class="status" id="versionStatus" style="margin-top:8px">Версию может менять только тех. администратор.</div>`:'<div class="status" style="margin-top:10px">Изменение доступно только тех. администратору.</div>';renderMediaEditor(sysInfo.role)}
@@ -495,7 +518,7 @@ let joinsChartInstance=null;
 async function loadGrowth(){
  let [ar,jr]=await Promise.all([fetch('/api/referrals'),fetch('/api/joins-analytics?days=30')]);
  if(jr.ok){let j=await jr.json();document.getElementById('joinsToday').textContent=j.today||0;document.getElementById('joinsYesterday').textContent=j.yesterday||0;let d=Number(j.delta||0);document.getElementById('joinsDelta').textContent=(d>0?'+':'')+d;document.getElementById('joinsPeriod').textContent=j.period_total||0;let ctx=document.getElementById('joinsChart');if(joinsChartInstance)joinsChartInstance.destroy();joinsChartInstance=new Chart(ctx,{type:'line',data:{labels:(j.series||[]).map(x=>x.date.slice(5).split('-').reverse().join('.')),datasets:[{label:'Входы',data:(j.series||[]).map(x=>x.joins),borderWidth:2,tension:.28,fill:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:'#aaa'}}},scales:{x:{ticks:{color:'#777'},grid:{color:'#1d1d20'}},y:{beginAtZero:true,ticks:{color:'#777',precision:0},grid:{color:'#1d1d20'}}}}});}
- let box=document.getElementById('referralRanking');if(!ar.ok){box.innerHTML='<div class="empty">Ошибка загрузки ссылок</div>';return}let a=await ar.json(),rows=a.links||[];box.innerHTML='<div style="overflow:auto"><table><tr><th>#</th><th>Владелец</th><th>Ссылка</th><th>Приглашено</th><th>Действие</th></tr>'+rows.map((x,i)=>`<tr><td>${i+1}</td><td>${escapeHtml(x.username?'@'+x.username:(x.name||'Без имени'))}</td><td style="max-width:420px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(x.link||'')}</td><td><b>${x.invited||0}</b></td><td>${x.type==='advertising'?'<span class="status">Системная</span>':`<button class="navbtn" onclick='deleteReferral(${JSON.stringify(x.link)})'>Удалить</button>`}</td></tr>`).join('')+'</table></div>';
+ let box=document.getElementById('referralRanking');if(!ar.ok){box.innerHTML='<div class="empty">Ошибка загрузки ссылок</div>';return}let a=await ar.json(),rows=a.links||[];box.innerHTML='<div style="overflow:auto"><table><tr><th>#</th><th>Владелец</th><th>Ссылка</th><th>Приглашено</th><th>Действие</th></tr>'+rows.map((x,i)=>`<tr><td>${i+1}</td><td>${escapeHtml(x.username?'@'+x.username:(x.name||'Без имени'))}</td><td style="max-width:420px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(x.link||'')}</td><td><b>${x.invited||0}</b></td><td>${x.type==='advertising'?'<span class="status">Системная</span>':`<button class="navbtn" onclick='deleteReferral(${JSON.stringify(x.link)})'>Удалить</button>`}</td></tr>`).join('')+'</table></div>';hubFilterTable('referralRanking',document.getElementById('hubReferralFilter')?.value||'');
 }
 async function deleteReferral(link){if(!confirm('Удалить эту персональную ссылку? Она также будет отозвана в Telegram, если Bot API разрешит.'))return;let r=await fetch('/api/referrals/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({link})});let j={};try{j=await r.json()}catch(e){};if(!r.ok){alert('Ошибка: '+(j.error||r.status));return}loadGrowth()}
 
@@ -518,7 +541,84 @@ async function loadChatSummary(){let box=document.getElementById('chatSummaryBox
 async function loadOctoberPlan(){let box=document.getElementById('octoberPlanBox');if(!box)return;box.innerHTML='<div class="empty">Загрузка…</div>';let r=await fetch('/api/october-plan');if(!r.ok){box.innerHTML='<div class="empty">Доступ только тех. администратору</div>';return}let j=await r.json(),items=j.items||[];let done=items.filter(x=>x.done).length;box.innerHTML=`<div style="padding:16px;border-bottom:1px solid #252529"><b>${done} / ${items.length}</b> выполнено • ${items.length-done} осталось</div><div style="overflow:auto"><table><tr><th>Готово</th><th>Дата</th><th>Активность</th><th>Формат</th><th>Текст поста</th></tr>${items.map(x=>`<tr style="${x.done?'opacity:.55':''}"><td><input type="checkbox" ${x.done?'checked':''} onchange="setOctoberDone('${x.date}',this.checked)"></td><td><b>${escapeHtml(x.date.split('-').reverse().join('.'))}</b></td><td>${escapeHtml(x.title||'')}</td><td>${escapeHtml(x.format||'')}</td><td style="white-space:normal;min-width:360px">${escapeHtml(x.post_text||'')}</td></tr>`).join('')}</table></div>`}
 async function setOctoberDone(date,done){let r=await fetch('/api/october-plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({date,done})});if(!r.ok){alert('Не удалось сохранить отметку');loadOctoberPlan();return}loadOctoberPlan()}
 
-loadReports();</script><script>function toggleHubMenu(){const o=document.body.classList.toggle('hub-menu-open');document.querySelector('.hub-menu-toggle')?.setAttribute('aria-expanded',String(o))}function closeHubMenu(){document.body.classList.remove('hub-menu-open');document.querySelector('.hub-menu-toggle')?.setAttribute('aria-expanded','false')}document.querySelectorAll('.topnav .navbtn').forEach(b=>b.addEventListener('click',closeHubMenu));document.addEventListener('keydown',e=>{if(e.key==='Escape')closeHubMenu()});</script><script>
+loadReports();</script><script>
+// V4: client-side filtering of already-authorized API results; no new permissions.
+function hubFilterTable(containerId,query){
+ const box=document.getElementById(containerId);if(!box)return;
+ const term=String(query||'').trim().toLocaleLowerCase('ru');
+ box.querySelectorAll('tbody tr').forEach(tr=>tr.classList.toggle('hub-filter-hidden',!!term&&!tr.textContent.toLocaleLowerCase('ru').includes(term)));
+}
+function hubExportTable(containerId,filename){
+ const box=document.getElementById(containerId),table=box?.querySelector('table');
+ if(!table){window.hubToast?.('Таблица пока не загружена',true);return}
+ const rows=[...table.querySelectorAll('tr')].filter(tr=>!tr.classList.contains('hub-filter-hidden'));
+ const csv=rows.map(tr=>[...tr.querySelectorAll('th,td')].filter((cell,i)=>!(/действие/i.test(table.querySelectorAll('th')[i]?.textContent||''))).map(cell=>'"'+cell.innerText.replace(/\s+/g,' ').trim().replace(/"/g,'""')+'"').join(';')).join('\r\n');
+ const blob=new Blob(['\ufeff'+csv],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');
+ a.href=url;a.download=filename;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
+ window.hubToast?.('Таблица экспортирована');
+}
+</script><script>
+function hubScheduleTable(target, payload){
+ const el=document.getElementById(target);
+ if(payload.missing){el.innerHTML='<div class="empty">Файл графика отсутствует</div>';return}
+ if(!payload.rows.length){el.innerHTML='<div class="empty">Записей пока нет</div>';return}
+ const table=document.createElement('table');const head=document.createElement('thead');const hr=document.createElement('tr');
+ for(const col of payload.columns){const th=document.createElement('th');th.textContent=col;hr.append(th)}head.append(hr);table.append(head);
+ const body=document.createElement('tbody');for(const row of payload.rows){const tr=document.createElement('tr');for(const val of row){const td=document.createElement('td');td.textContent=val;tr.append(td)}body.append(tr)}table.append(body);el.replaceChildren(table);
+}
+let hubLiveData=null;
+async function hubLiveLoad(){
+ const status=document.getElementById('hubLiveStatus');
+ try{const r=await fetch('/api/hub/schedule-live',{credentials:'same-origin'});if(!r.ok)throw Error('HTTP '+r.status);
+ hubLiveData=await r.json();const u=document.getElementById('hubLiveUser'),d=document.getElementById('hubLiveDay');
+ const prev=u.value;u.replaceChildren();(hubLiveData.users||[]).forEach(x=>{const o=new Option((x.name||x.id)+' · '+x.id,x.id);u.add(o)});
+ if(prev&&[...u.options].some(o=>o.value===prev))u.value=prev;
+ d.replaceChildren();const days=['Пн','Вт','Ср','Чт','Пт','Сб','Вс'];(hubLiveData.weekdays||[]).forEach((x,i)=>d.add(new Option(days[i]||x,x)));
+ hubLiveRender();status.textContent='Загружены актуальные данные графика';
+ }catch(e){status.textContent='Не удалось загрузить живой график: '+e.message}
+}
+function hubLiveRender(){if(!hubLiveData)return;
+ const uid=document.getElementById('hubLiveUser').value,day=document.getElementById('hubLiveDay').value;
+ const rec=(((hubLiveData.assignments||{})[uid]||{})[day]||{});
+ document.getElementById('hubLiveOff').checked=!!rec.off;
+ const box=document.getElementById('hubLiveDuties');box.replaceChildren();
+ Object.entries(hubLiveData.duties||{}).forEach(([key,label])=>{const wrap=document.createElement('label');wrap.className='hub-duty-choice';const input=document.createElement('input');input.type='checkbox';input.value=key;input.checked=(rec.duties||[]).includes(key);wrap.append(input,document.createTextNode(' '+label));box.append(wrap)});
+}
+async function hubLiveSave(){const status=document.getElementById('hubLiveStatus');const uid=document.getElementById('hubLiveUser').value,day=document.getElementById('hubLiveDay').value;
+ if(!uid||!day){status.textContent='Выбери сотрудника и день';return}
+ const body={uid,day,expected:(((hubLiveData.assignments||{})[uid]||{})[day]||{}),off:document.getElementById('hubLiveOff').checked,duties:[...document.querySelectorAll('#hubLiveDuties input:checked')].map(x=>x.value)};
+ try{const r=await fetch('/api/hub/schedule-live',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await r.json();if(r.status===409){await hubLiveLoad();throw Error('График изменён другим администратором. Данные обновлены, проверьте их и сохраните снова.')}if(!r.ok)throw Error(data.error||'HTTP '+r.status);
+ hubLiveData.assignments[uid]??={};hubLiveData.assignments[uid][day]=data.record;hubLiveRender();status.textContent='Сохранено в общей базе';window.hubToast?.('График сохранён');
+ }catch(e){status.textContent='Ошибка сохранения: '+e.message;window.hubToast?.('Ошибка сохранения',true)}
+}
+async function hubDayoffLoad(){
+ const el=document.getElementById('hubDayoffReviewRows'),st=document.getElementById('hubDayoffReviewStatus');
+ try{const r=await fetch('/api/hub/dayoff-requests',{credentials:'same-origin'});if(!r.ok)throw Error('HTTP '+r.status);const data=await r.json();
+ el.replaceChildren();const table=document.createElement('table');const head=document.createElement('tr');
+ for(const label of ['Заявка','Сотрудник','Дата','Причина','Статус','Решение']){const th=document.createElement('th');th.textContent=label;head.append(th)}table.append(head);
+ for(const item of data.requests||[]){const tr=document.createElement('tr');for(const val of [item.id,item.name+' ('+item.user_id+')',item.date,item.reason,item.status]){const td=document.createElement('td');td.textContent=val;tr.append(td)}
+ const action=document.createElement('td');if(item.status==='Pending')for(const [label,decision] of [['Одобрить','Approved'],['Отклонить','Rejected']]){const btn=document.createElement('button');btn.className='btn hub-secondary';btn.textContent=label;btn.onclick=()=>hubDayoffReview(item.id,decision);action.append(btn)}tr.append(action);table.append(tr)}
+ el.append(table);st.textContent='Источник: '+data.source+' · '+(data.requests||[]).length+' заявок';
+ }catch(e){st.textContent='Не удалось загрузить заявки: '+e.message}
+}
+async function hubDayoffReview(id,decision){
+ if(!confirm((decision==='Approved'?'Одобрить':'Отклонить')+' заявку '+id+'?'))return;
+ const st=document.getElementById('hubDayoffReviewStatus');
+ try{const r=await fetch('/api/hub/dayoff-review',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,decision})});const data=await r.json();if(!r.ok)throw Error(data.error||'HTTP '+r.status);window.hubToast?.('Решение сохранено');await hubDayoffLoad()}
+ catch(e){st.textContent='Ошибка: '+e.message;await hubDayoffLoad()}
+}
+async function hubScheduleLoad(){
+ const status=document.getElementById('hubScheduleUpdated');status.textContent='Загрузка данных…';
+ try{const r=await fetch('/api/hub/schedule-snapshot',{credentials:'same-origin'});if(!r.ok)throw Error('HTTP '+r.status);const data=await r.json();
+ hubScheduleTable('hubScheduleRows',data.schedule);hubScheduleTable('hubDaysOffRows',data.days_off);
+ document.getElementById('hubScheduleCount').textContent=data.schedule.rows.length;
+ document.getElementById('hubDaysOffCount').textContent=data.days_off.rows.length;
+ hubFilterTable('hubScheduleRows',document.getElementById('hubScheduleFilter').value);
+ hubFilterTable('hubDaysOffRows',document.getElementById('hubDaysOffFilter').value);
+ status.textContent='Источник: XLSX-снимки · График обновлён: '+(data.schedule.updated_at||'нет данных')+' · Заявки: '+(data.days_off.updated_at||'нет данных');
+ }catch(e){status.textContent='Не удалось загрузить график: '+e.message;window.hubToast?.('Ошибка загрузки графика',true)}
+}
+</script><script>function toggleHubMenu(){const o=document.body.classList.toggle('hub-menu-open');document.querySelector('.hub-menu-toggle')?.setAttribute('aria-expanded',String(o))}function closeHubMenu(){document.body.classList.remove('hub-menu-open');document.querySelector('.hub-menu-toggle')?.setAttribute('aria-expanded','false')}document.querySelectorAll('.topnav .navbtn').forEach(b=>b.addEventListener('click',closeHubMenu));document.addEventListener('keydown',e=>{if(e.key==='Escape')closeHubMenu()});</script><script>
 (function(){
  const icons={overview:'<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',staff:'<circle cx="9" cy="8" r="3"/><path d="M3 20v-2a6 6 0 0 1 12 0v2"/><path d="M17 5a3 3 0 0 1 0 6M18 14a5 5 0 0 1 3 5"/>',link:'<path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1"/><path d="M14 11a5 5 0 0 0-7.1 0l-2 2a5 5 0 0 0 7.1 7.1l1.1-1.1"/>',calendar:'<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M7 3v4M17 3v4M3 10h18"/>',shield:'<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/>',chart:'<path d="M4 20V10M10 20V4M16 20v-8M22 20v-6"/>',settings:'<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/>',file:'<path d="M6 2h9l5 5v15H6z"/><path d="M15 2v6h5M9 12h8M9 16h8"/>',bot:'<rect x="4" y="7" width="16" height="13" rx="3"/><path d="M12 3v4M9 3h6M8 13h.01M16 13h.01M9 17h6"/>'};
  document.querySelectorAll('.topnav .navbtn').forEach((b,i)=>{if(b.querySelector('.hub-nav-icon'))return;const t=(b.textContent||'').toLowerCase();const k=/сотруд|админ|персонал/.test(t)?'staff':/ссыл|реферал|приглаш/.test(t)?'link':/график|выходн|календар|план/.test(t)?'calendar':/модерац|наруш|безопас/.test(t)?'shield':/аналит|статист|отчёт/.test(t)?'chart':/настрой|управлен/.test(t)?'settings':/бот|игр/.test(t)?'bot':/истори|лог|изменен/.test(t)?'file':'overview';const e=document.createElement('span');e.className='hub-nav-icon';e.setAttribute('aria-hidden','true');e.innerHTML='<svg viewBox="0 0 24 24">'+icons[k]+'</svg>';b.prepend(e)});
@@ -535,6 +635,11 @@ function hubMetric(label,value){const d=document.createElement('div');d.classNam
 async function hubOverviewLoad(){const box=document.getElementById('hubOverviewStats');if(!box)return;box.replaceChildren(hubMetric('СТАТУС','Загрузка…'));const endpoints=[['/api/status','БОТ / API'],['/api/chat-summary','ЧАТОВ В СВОДКЕ'],['/api/reports','СОХРАНЁННЫХ ОТЧЁТОВ'],['/api/referrals','РЕФЕРАЛЬНЫЕ ДАННЫЕ']];const res=await Promise.allSettled(endpoints.map(async ([url,label])=>{const r=await fetch(url,{credentials:'same-origin'});if(!r.ok)throw Error(String(r.status));return {label,data:await r.json()}}));box.replaceChildren();res.forEach((r,i)=>{if(r.status!=='fulfilled'){box.append(hubMetric(endpoints[i][1],'Недоступно'));return}const {label,data}=r.value;let value='Доступно';if(label==='ЧАТОВ В СВОДКЕ')value=(data.chats||[]).length;if(label==='СОХРАНЁННЫХ ОТЧЁТОВ')value=(data.reports||[]).length;if(label==='БОТ / API')value=data.status||data.ok===true&&'Работает'||'На связи';if(label==='РЕФЕРАЛЬНЫЕ ДАННЫЕ')value=Array.isArray(data)?data.length:(Array.isArray(data.links)?data.links.length:'Доступно');box.append(hubMetric(label,value))})}
 async function hubStaffLoad(){const box=document.getElementById('hubStaffRows');if(!box)return;box.textContent='Загрузка…';try{const r=await fetch('/api/staff');if(r.status===403){box.textContent='Только владелец может управлять сотрудниками.';document.getElementById('hubStaffUid').disabled=true;document.getElementById('hubStaffRole').disabled=true;return}if(!r.ok)throw Error(r.status);const j=await r.json();const t=document.createElement('table');t.innerHTML='<thead><tr><th>Telegram ID</th><th>Роль</th><th>Действия</th></tr></thead>';const tb=document.createElement('tbody');(j.staff||[]).forEach(u=>{const tr=document.createElement('tr');const a=document.createElement('td');a.textContent=u.uid;const b=document.createElement('td');b.textContent=({owner:'Владелец',deputy:'Заместитель',admin:'Администратор',moderator:'Модератор',disabled:'Нет доступа'})[u.role]||u.role;const c=document.createElement('td');if(u.role!=='owner'){const btn=document.createElement('button');btn.className='navbtn';btn.textContent='Изменить';btn.onclick=()=>{document.getElementById('hubStaffUid').value=u.uid;document.getElementById('hubStaffRole').value=u.role==='disabled'?'moderator':u.role;window.scrollTo({top:0,behavior:'smooth'})};c.append(btn)}tr.append(a,b,c);tb.append(tr)});t.append(tb);box.replaceChildren(t)}catch(e){box.textContent='Ошибка загрузки: '+e.message}}
 async function hubStaffSave(){const uid=Number(document.getElementById('hubStaffUid').value),role=document.getElementById('hubStaffRole').value,msg=document.getElementById('hubStaffMsg');if(!Number.isSafeInteger(uid)||uid<=0){msg.textContent='Укажи корректный Telegram ID';return}if(!confirm('Изменить роль сотрудника '+uid+' на '+role+'? Все его активные сессии будут завершены.'))return;try{const r=await fetch('/api/staff/role',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({uid,role})});const j=await r.json();if(!r.ok)throw Error(j.error||r.status);msg.textContent='Роль сохранена. Сессии сотрудника отозваны.';if(window.hubToast)hubToast('Права обновлены');hubStaffLoad()}catch(e){msg.textContent='Ошибка: '+e.message;if(window.hubToast)hubToast(e.message,true)}}
+let hubAuditEvents=[];
+async function hubSecurityLoad(){const sb=document.getElementById('hubSessionRows'),ab=document.getElementById('hubAuditRows');sb.textContent='Загрузка…';ab.textContent='Загрузка…';try{const [sr,ar]=await Promise.all([fetch('/api/sessions'),fetch('/api/login-audit')]);if(sr.status===403||ar.status===403){sb.textContent='Доступ только владельцу';ab.textContent='Доступ только владельцу';return}if(!sr.ok||!ar.ok)throw Error('Ошибка сервера');const sessions=(await sr.json()).sessions||[];hubAuditEvents=(await ar.json()).events||[];document.getElementById('hubSessionCount').textContent=sessions.length;document.getElementById('hubAuditCount').textContent=hubAuditEvents.length;const t=document.createElement('table');t.innerHTML='<thead><tr><th>Telegram ID</th><th>Роль</th><th>Последняя активность</th><th>Истекает</th><th>Действие</th></tr></thead>';const body=document.createElement('tbody');for(const x of sessions){const tr=document.createElement('tr');for(const value of [x.uid,x.role,new Date(x.last_seen*1000).toLocaleString('ru-RU'),new Date(x.expires*1000).toLocaleString('ru-RU')]){const td=document.createElement('td');td.textContent=value;tr.append(td)}const td=document.createElement('td'),btn=document.createElement('button');btn.className='navbtn';btn.textContent='Завершить';btn.onclick=()=>hubRevokeUser(x.uid);td.append(btn);tr.append(td);body.append(tr)}t.append(body);sb.replaceChildren(t);hubRenderAudit()}catch(e){sb.textContent='Ошибка: '+e.message;ab.textContent='Ошибка: '+e.message}}
+function hubRenderAudit(){const box=document.getElementById('hubAuditRows');if(!box)return;const q=(document.getElementById('hubAuditSearch')?.value||'').trim().toLowerCase();const events=hubAuditEvents.filter(e=>String(e.uid).includes(q)||String(e.event).toLowerCase().includes(q));const t=document.createElement('table');t.innerHTML='<thead><tr><th>Дата</th><th>Telegram ID</th><th>Событие</th></tr></thead>';const body=document.createElement('tbody');for(const e of events){const tr=document.createElement('tr');for(const v of [new Date(e.at*1000).toLocaleString('ru-RU'),e.uid,e.event]){const td=document.createElement('td');td.textContent=v;tr.append(td)}body.append(tr)}t.append(body);box.replaceChildren(t)}
+async function hubRevokeUser(uid){if(!confirm('Завершить все сессии Telegram ID '+uid+'?'))return;try{const r=await fetch('/api/revoke-user',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({uid})});if(!r.ok)throw Error('Не удалось завершить сессии');window.hubToast?.('Сессии завершены');hubSecurityLoad()}catch(e){window.hubToast?.(e.message,true)}}
+async function hubRevokeAll(){if(!confirm('Завершить все сессии сотрудников, кроме своей?'))return;try{const r=await fetch('/api/sessions/revoke-others',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});if(!r.ok)throw Error('Ошибка завершения сессий');window.hubToast?.('Чужие сессии завершены');hubSecurityLoad()}catch(e){window.hubToast?.(e.message,true)}}
 window.addEventListener('DOMContentLoaded',()=>{const first=document.querySelector('.topnav>.navbtn');if(first){document.querySelectorAll('.topnav>.navbtn').forEach(b=>b.classList.remove('active'));first.classList.add('active')}document.getElementById('reportsPage')?.classList.remove('active');document.getElementById('hubOverview')?.classList.add('active');hubOverviewLoad()});
 </script></body></html>'''
 
@@ -656,6 +761,15 @@ async def revoke_user_api(request):
     hub_auth.revoke_user(uid)
     return web.json_response({'ok':True,'uid':uid})
 
+async def sessions_api(request):
+    return web.json_response({'sessions':hub_auth.active_sessions()})
+
+async def revoke_others_api(request):
+    session=_read_session(request)
+    if not session:return web.json_response({'error':'unauthorized'},status=401)
+    hub_auth.revoke_other_sessions(session['uid'],request.cookies.get('shinobi_session',''))
+    return web.json_response({'ok':True})
+
 async def staff_api(request):
     if (_read_session(request) or {}).get('role') != 'owner':
         return web.json_response({'error':'forbidden'},status=403)
@@ -671,6 +785,111 @@ async def staff_role_api(request):
         return web.json_response({'error':str(e)},status=400)
     return web.json_response({'ok':True,'uid':uid,'role':new_role})
 
+async def hub_schedule_live_api(request):
+    """Current duties, shared with the Telegram bot via PostgreSQL."""
+    from schedule_system import _load_assignments, _known_users, WEEKDAYS, DUTIES
+    try:
+        return web.json_response({"assignments": _load_assignments(), "users": _known_users(), "weekdays": WEEKDAYS, "duties": DUTIES}, dumps=lambda v: json.dumps(v, ensure_ascii=False))
+    except Exception as exc:
+        print("[HUB SCHEDULE LIVE]", type(exc).__name__)
+        return web.json_response({"error": "schedule_unavailable"}, status=503)
+
+
+async def hub_schedule_save_api(request):
+    from schedule_system import update_schedule_record_atomic, WEEKDAYS, DUTIES
+    session = _read_session(request)
+    if not session or session["role"] not in ("owner", "deputy"):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        body = await request.json()
+        uid = str(int(body["uid"]))
+        day = body["day"]
+        if int(uid) <= 0 or day not in WEEKDAYS:
+            raise ValueError("invalid user/day")
+        duties = body.get("duties", [])
+        if not isinstance(duties, list) or len(duties) > len(DUTIES) or any(x not in DUTIES for x in duties):
+            raise ValueError("invalid duties")
+        off = body.get("off", False)
+        if not isinstance(off, bool):
+            raise ValueError("invalid off")
+        expected = body.get("expected")
+        if not isinstance(expected, dict):
+            raise ValueError("missing expected record")
+        rec = update_schedule_record_atomic(uid, day, expected, {"off": off, "duties": [] if off else list(dict.fromkeys(duties)), "always": False})
+        if rec is None:
+            return web.json_response({"error": "schedule_conflict", "message": "График изменился. Обновите данные перед сохранением."}, status=409)
+        hub_auth.audit(session["uid"], "schedule_updated_" + uid + "_" + day)
+        return web.json_response({"ok": True, "record": rec})
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return web.json_response({"error": "invalid_schedule_input"}, status=400)
+    except Exception as exc:
+        print("[HUB SCHEDULE SAVE]", type(exc).__name__)
+        return web.json_response({"error": "schedule_save_failed"}, status=503)
+
+
+async def hub_dayoff_pending_api(request):
+    from schedule_system import list_dayoff_requests
+    try:
+        return web.json_response({'requests':list_dayoff_requests(300), 'source':'postgresql' if os.getenv('DATABASE_URL') else 'local_xlsx_snapshot'})
+    except Exception as exc:
+        print('[HUB DAYOFF]',type(exc).__name__)
+        return web.json_response({'error':'dayoff_unavailable'},status=503)
+
+
+async def hub_dayoff_review_api(request):
+    session = _read_session(request)
+    if not session or session['role'] not in ('owner','deputy'):
+        return web.json_response({'error':'forbidden'},status=403)
+    try:
+        body = await request.json()
+        request_id = str(body['id'])
+        decision = str(body['decision'])
+        from schedule_system import review_dayoff_request
+        found = review_dayoff_request(request_id,decision,session['uid'])
+        if not found:
+            return web.json_response({'error':'already_reviewed_or_not_found'},status=409)
+        hub_auth.audit(session['uid'],'dayoff_'+decision.lower()+'_'+request_id)
+        # Telegram delivery is best effort; database decision is already committed.
+        try:
+            import aiohttp
+            token=os.getenv('BOT_TOKEN','')
+            if token:
+                msg=('✅' if decision=='Approved' else '❌')+' Заявка '+request_id+(' одобрена' if decision=='Approved' else ' отклонена')+'\nДата: '+str(found['date'])
+                async with aiohttp.ClientSession() as http:
+                    async with http.post('https://api.telegram.org/bot'+token+'/sendMessage',json={'chat_id':int(found['user_id']),'text':msg},timeout=aiohttp.ClientTimeout(total=5)) as response:
+                        if response.status!=200:print('[HUB DAYOFF NOTIFY] Telegram HTTP',response.status)
+        except Exception as exc:
+            print('[HUB DAYOFF NOTIFY]',type(exc).__name__)
+        return web.json_response({'ok':True,'request':found})
+    except (ValueError,TypeError,KeyError,json.JSONDecodeError):
+        return web.json_response({'error':'invalid_request'},status=400)
+    except Exception as exc:
+        print('[HUB DAYOFF REVIEW]',type(exc).__name__)
+        return web.json_response({'error':'review_failed'},status=503)
+
+
+async def hub_schedule_snapshot_api(request):
+    """Read-only display of the same XLSX snapshots used by report exports."""
+    from openpyxl import load_workbook
+    def read_sheet(filename, limit=1500):
+        path = BASE_DIR / filename
+        if not path.is_file():
+            return {"columns": [], "rows": [], "updated_at": None, "missing": True}
+        book = load_workbook(path, read_only=True, data_only=True)
+        try:
+            sheet = book.active
+            it = sheet.iter_rows(values_only=True)
+            columns = [str(v or '') for v in next(it, ())]
+            rows = [[str(v) if v is not None else '' for v in row] for _, row in zip(range(limit), it)]
+        finally:
+            book.close()
+        return {"columns": columns, "rows": rows, "updated_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec='seconds'), "missing": False}
+    try:
+        return web.json_response({"schedule": read_sheet('work_schedules.xlsx'), "days_off": read_sheet('day_off_requests.xlsx'), "source": "local_xlsx_snapshot"}, dumps=lambda v: json.dumps(v, ensure_ascii=False))
+    except Exception:
+        return web.json_response({"error": "schedule_snapshot_unavailable"}, status=500)
+
+
 async def reports(request):
     return web.json_response({"reports": list_reports()}, dumps=lambda x: json.dumps(x, ensure_ascii=False))
 
@@ -681,7 +900,7 @@ async def create_report_from_web(request):
     # API-key также остаётся допустимым для служебной интеграции.
     if not session and not _api_authorized(request):
         return web.json_response({"error": "forbidden"}, status=403)
-    if session and session.get("role") not in ("owner", "deputy", "admin"):
+    if session and session.get("role") not in ("owner", "deputy"):
         return web.json_response({"error": "forbidden"}, status=403)
     try:
         requested_by = "web:" + (session.get("role") if session else "api")
@@ -774,7 +993,7 @@ async def referrals_api(request):
 
 async def referral_delete(request):
     session = _read_session(request)
-    if not session or session.get("role") not in ("owner", "deputy", "admin"):
+    if not session or session.get("role") not in ("owner", "deputy"):
         return web.json_response({"error": "owner_or_tech_only"}, status=403)
     try:
         payload = await request.json()
@@ -799,6 +1018,8 @@ async def referral_delete(request):
                     revoked = bool(result.get("ok"))
         except Exception:
             revoked = False
+    if token and not revoked:
+        return web.json_response({"error": "telegram_revoke_failed", "message": "Telegram не подтвердил отзыв ссылки; запись сохранена."}, status=502)
     owner_id = info.get("owner_id")
     del links[link]
     if owner_id is not None:
@@ -860,7 +1081,7 @@ def _market_wallets_write(data):
 
 async def market_wallets_api(request):
     session = _read_session(request)
-    if not session or session.get("role") not in ("owner", "deputy", "admin"):
+    if not session or session.get("role") not in ("owner", "deputy"):
         return web.json_response({"error":"owner_or_tech_only"}, status=403)
     d = _bot_data_read(); wallets = _market_wallets_read(); rows=[]
     for chat_id, chat in (d.get("game_hub") or {}).items():
@@ -878,7 +1099,7 @@ async def market_wallets_api(request):
 
 async def market_wallet_update(request):
     session = _read_session(request)
-    if not session or session.get("role") not in ("owner", "deputy", "admin"):
+    if not session or session.get("role") not in ("owner", "deputy"):
         return web.json_response({"error":"owner_or_tech_only"}, status=403)
     try:
         payload=await request.json(); chat_id=str(int(payload.get("chat_id"))); uid=str(int(payload.get("user_id"))); amount=int(payload.get("amount")); mode=str(payload.get("mode","add"))
@@ -1096,7 +1317,7 @@ def _build_full_backup_zip():
 
 async def download_full_backup(request):
     session = _read_session(request)
-    if not session or session.get("role") not in ("owner", "deputy", "admin"):
+    if not session or session.get("role") not in ("owner", "deputy"):
         return web.json_response({"error": "forbidden"}, status=403)
     expected = os.getenv("BACKUP_EXPORT_CODE", "").strip()
     if not expected:
@@ -1174,6 +1395,8 @@ async def start_stats_api():
     app.router.add_get("/auth/telegram/start", oidc_start)
     app.router.add_get("/auth/telegram/callback", oidc_callback)
     app.router.add_get("/api/login-audit", login_audit)
+    app.router.add_get("/api/sessions", sessions_api)
+    app.router.add_post("/api/sessions/revoke-others", revoke_others_api)
     app.router.add_get("/api/staff", staff_api)
     app.router.add_post("/api/staff/role", staff_role_api)
     app.router.add_post("/api/revoke-user", revoke_user_api)
@@ -1188,6 +1411,11 @@ async def start_stats_api():
     app.router.add_post("/api/system/version", update_version)
     app.router.add_get("/media/{kind}", media_file)
     app.router.add_post("/api/media/{kind}", upload_media)
+    app.router.add_get("/api/hub/schedule-snapshot", hub_schedule_snapshot_api)
+    app.router.add_get("/api/hub/dayoff-requests", hub_dayoff_pending_api)
+    app.router.add_post("/api/hub/dayoff-review", hub_dayoff_review_api)
+    app.router.add_get("/api/hub/schedule-live", hub_schedule_live_api)
+    app.router.add_post("/api/hub/schedule-live", hub_schedule_save_api)
     app.router.add_get("/api/reports", reports)
     app.router.add_get("/api/control", control_snapshot)
     app.router.add_get("/api/referrals", referrals_api)

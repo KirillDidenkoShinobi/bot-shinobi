@@ -152,13 +152,73 @@ class ScheduleStates(StatesGroup):
     waiting_dayoff_reason = State()
 
 
+def _timezone_db():
+    """Use the shared PostgreSQL store when configured; JSON remains a local fallback."""
+    url = os.getenv("DATABASE_URL", "").strip()
+    if not url:
+        return None
+    import psycopg2
+    conn = psycopg2.connect(url, connect_timeout=8)
+    with conn.cursor() as cur:
+        cur.execute("CREATE TABLE IF NOT EXISTS shinobi_user_timezones (uid BIGINT PRIMARY KEY, info TEXT NOT NULL, updated_at BIGINT NOT NULL)")
+    conn.commit()
+    return conn
+
 def _load_timezones() -> dict:
+    conn = _timezone_db()
+    if conn is not None:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT uid, info FROM shinobi_user_timezones")
+                rows = cur.fetchall()
+            result = {str(uid): json.loads(info) for uid, info in rows}
+            if not result:
+                try:
+                    with open(TIMEZONE_FILE, "r", encoding="utf-8") as f:
+                        legacy = json.load(f)
+                    if isinstance(legacy, dict) and legacy:
+                        _save_timezones(legacy)
+                        return legacy
+                except (OSError, json.JSONDecodeError):
+                    pass
+            return result
+        finally:
+            conn.close()
     try:
-        with open(TIMEZONE_FILE, "r", encoding="utf-8") as f: return json.load(f)
-    except (OSError, json.JSONDecodeError): return {}
+        with open(TIMEZONE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 def _save_timezones(data: dict):
-    with open(TIMEZONE_FILE, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False, indent=2)
+    conn = _timezone_db()
+    if conn is not None:
+        try:
+            with conn.cursor() as cur:
+                for uid, info in data.items():
+                    cur.execute("INSERT INTO shinobi_user_timezones(uid,info,updated_at) VALUES(%s,%s,EXTRACT(EPOCH FROM NOW())::BIGINT) ON CONFLICT(uid) DO UPDATE SET info=EXCLUDED.info, updated_at=EXCLUDED.updated_at", (int(uid), json.dumps(info, ensure_ascii=False)))
+            conn.commit()
+        finally:
+            conn.close()
+        return
+    tmp = TIMEZONE_FILE + '.tmp'
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, TIMEZONE_FILE)
+
+def _delete_timezone(uid):
+    conn = _timezone_db()
+    if conn is not None:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM shinobi_user_timezones WHERE uid=%s", (int(uid),))
+            conn.commit()
+        finally:
+            conn.close()
+    else:
+        data = _load_timezones()
+        data.pop(str(uid), None)
+        _save_timezones(data)
 
 def user_tz_info(user_id) -> dict:
     return _load_timezones().get(str(user_id), {})
@@ -662,7 +722,101 @@ def next_request_id(sheet) -> str:
     return f"DO{max_num + 1:04d}"
 
 
+def _dayoff_db():
+    """One shared request store for Railway web and Telegram workers."""
+    if not os.getenv("DATABASE_URL"):
+        return None
+    import psycopg2
+    conn = psycopg2.connect(os.environ["DATABASE_URL"], connect_timeout=8)
+    with conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS hub_dayoff_requests (
+            request_id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, username TEXT NOT NULL DEFAULT '',
+            display_name TEXT NOT NULL DEFAULT '', requested_date TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'Pending',
+            updated_at BIGINT NOT NULL, reviewed_by BIGINT)""")
+        # Import existing workbook only for IDs not already in PostgreSQL.
+        # Existing database decisions always win over stale XLSX snapshots.
+        if os.path.isfile(DAYOFF_FILE):
+            book = load_workbook(DAYOFF_FILE, read_only=True, data_only=True)
+            try:
+                for row in book.active.iter_rows(min_row=2, values_only=True):
+                    if not row or not row[0] or not str(row[1] or '').isdigit():
+                        continue
+                    status = normalize_status(row[6] or 'Pending')
+                    if status not in ('Pending', 'Approved', 'Rejected'):
+                        status = 'Pending'
+                    cur.execute("""INSERT INTO hub_dayoff_requests
+                        (request_id,user_id,username,display_name,requested_date,reason,status,updated_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(request_id) DO NOTHING""",
+                        (str(row[0]), int(row[1]), str(row[2] or ''), str(row[3] or ''),
+                         str(row[4] or ''), str(row[5] or ''), status, int(datetime.now().timestamp())))
+            finally:
+                book.close()
+    conn.commit()
+    return conn
+
+
+def list_dayoff_requests(limit=300, user_id=None):
+    conn = _dayoff_db()
+    if conn is None:
+        ensure_dayoff_file()
+        book = load_workbook(DAYOFF_FILE, read_only=True, data_only=True)
+        try:
+            rows = list(book.active.iter_rows(min_row=2, values_only=True))
+        finally:
+            book.close()
+        result = [dict(id=str(r[0]), user_id=str(r[1]), name=str(r[3] or ''),
+                       date=str(r[4] or ''), reason=str(r[5] or ''),
+                       status=normalize_status(r[6] or 'Pending')) for r in rows if r and r[0] and (user_id is None or str(r[1]) == str(user_id))]
+        return result[-limit:]
+    try:
+        with conn.cursor() as cur:
+            if user_id is None:
+                cur.execute('SELECT request_id,user_id,display_name,requested_date,reason,status FROM hub_dayoff_requests ORDER BY updated_at DESC,request_id DESC LIMIT %s', (limit,))
+            else:
+                cur.execute('SELECT request_id,user_id,display_name,requested_date,reason,status FROM hub_dayoff_requests WHERE user_id=%s ORDER BY updated_at DESC LIMIT %s', (int(user_id),limit))
+            return [dict(zip(('id','user_id','name','date','reason','status'),map(str,row))) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def review_dayoff_request(request_id, status, reviewer_id):
+    if status not in ('Approved','Rejected') or not re.fullmatch(r'[A-Za-z0-9_-]{1,50}',request_id):
+        raise ValueError('invalid request')
+    conn = _dayoff_db()
+    if conn is None:
+        raise RuntimeError('PostgreSQL required for shared reviews')
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE hub_dayoff_requests SET status=%s,reviewed_by=%s,updated_at=%s
+                WHERE request_id=%s AND status='Pending'
+                RETURNING user_id,requested_date,reason""",
+                (status,int(reviewer_id),int(datetime.now().timestamp()),request_id))
+            row = cur.fetchone()
+        conn.commit()
+        return {'request_id':request_id,'user_id':row[0],'date':row[1],'reason':row[2],'status':status} if row else None
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 async def save_dayoff_request(user, requested_date: str, reason: str) -> str:
+    if os.getenv("DATABASE_URL"):
+        import secrets
+        request_id = 'DO' + datetime.now().strftime('%Y%m%d%H%M%S') + secrets.token_hex(3).upper()
+        conn = _dayoff_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""INSERT INTO hub_dayoff_requests
+                    (request_id,user_id,username,display_name,requested_date,reason,status,updated_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,'Pending',%s)""",
+                    (request_id,int(user.id),username_of(user),display_name(user),requested_date,reason,int(datetime.now().timestamp())))
+            conn.commit()
+            return request_id
+        finally:
+            conn.close()
     async with _excel_lock:
         ensure_dayoff_file()
         workbook = load_workbook(DAYOFF_FILE)
@@ -688,7 +842,9 @@ async def save_dayoff_request(user, requested_date: str, reason: str) -> str:
         return request_id
 
 
-async def update_dayoff_status(request_id: str, status: str) -> Optional[dict]:
+async def update_dayoff_status(request_id: str, status: str, reviewer_id: int = 0) -> Optional[dict]:
+    if os.getenv('DATABASE_URL'):
+        return review_dayoff_request(request_id, status, reviewer_id)
     async with _excel_lock:
         ensure_dayoff_file()
         workbook = load_workbook(DAYOFF_FILE)
@@ -717,6 +873,8 @@ async def update_dayoff_status(request_id: str, status: str) -> Optional[dict]:
 
 
 def user_dayoff_requests(user_id: int) -> list[dict]:
+    if os.getenv('DATABASE_URL'):
+        return [{'id':r['id'],'date':r['date'],'reason':r['reason'],'status':r['status']} for r in reversed(list_dayoff_requests(8,user_id))]
     ensure_dayoff_file()
     workbook = load_workbook(DAYOFF_FILE)
     sheet = workbook.active
@@ -998,13 +1156,13 @@ async def schedule_save_callback(callback: CallbackQuery, state: FSMContext):
 
     try:
         await save_user_schedule(callback.from_user, draft)
-        assignments = _load_assignments()
         uid = str(callback.from_user.id)
-        if uid not in assignments:
-            assignments[uid] = {}
-            for day, item in draft.items():
-                assignments[uid][day] = {"off": item.get("status") == "Day Off", "start": item.get("start", ""), "end": item.get("end", ""), "duties": []}
-            _save_assignments(assignments)
+        def change(assignments):
+            if uid not in assignments:
+                assignments[uid] = {}
+                for day, item in draft.items():
+                    assignments[uid][day] = {"off": item.get("status") == "Day Off", "start": item.get("start", ""), "end": item.get("end", ""), "duties": []}
+        mutate_schedule_atomic(change)
     except Exception as error:
         await callback.answer()
         await callback.message.answer(
@@ -1231,7 +1389,7 @@ async def dayoff_approve(callback: CallbackQuery):
         return
 
     request_id = callback.data.replace("sch_ok_", "", 1)
-    found = await update_dayoff_status(request_id, "Approved")
+    found = await update_dayoff_status(request_id, "Approved", callback.from_user.id)
     if not found:
         await callback.answer("Заявка не найдена", show_alert=True)
         return
@@ -1261,7 +1419,7 @@ async def dayoff_reject(callback: CallbackQuery):
         return
 
     request_id = callback.data.replace("sch_no_", "", 1)
-    found = await update_dayoff_status(request_id, "Rejected")
+    found = await update_dayoff_status(request_id, "Rejected", callback.from_user.id)
     if not found:
         await callback.answer("Заявка не найдена", show_alert=True)
         return
@@ -1329,18 +1487,125 @@ class AdminScheduleStates(StatesGroup):
     waiting_hours = State()
 
 
-def _load_assignments() -> dict:
+def _assignments_db():
+    """Shared source of truth for web and bot when PostgreSQL is configured."""
+    if not os.getenv("DATABASE_URL"):
+        return None
+    import psycopg2
+    conn = psycopg2.connect(os.environ["DATABASE_URL"], connect_timeout=8)
+    with conn.cursor() as cur:
+        cur.execute("CREATE TABLE IF NOT EXISTS hub_schedule_state (key TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at BIGINT NOT NULL)")
+    conn.commit()
+    return conn
+
+
+def _local_assignments():
     try:
         with open(ASSIGNMENTS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
+            value = json.load(f)
+            return value if isinstance(value, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
 
 
+def _load_assignments() -> dict:
+    conn = _assignments_db()
+    if conn is None:
+        return _local_assignments()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT payload FROM hub_schedule_state WHERE key=%s", ("admin_assignments",))
+            row = cur.fetchone()
+            if row is None:
+                initial = _local_assignments()
+                cur.execute("INSERT INTO hub_schedule_state(key,payload,updated_at) VALUES(%s,%s,%s) ON CONFLICT(key) DO NOTHING", ("admin_assignments", json.dumps(initial, ensure_ascii=False), int(datetime.now().timestamp())))
+                conn.commit()
+                cur.execute("SELECT payload FROM hub_schedule_state WHERE key=%s", ("admin_assignments",))
+                row = cur.fetchone()
+            return json.loads(row[0]) if row else {}
+    finally:
+        conn.close()
+
+
 def _save_assignments(data: dict):
-    with open(ASSIGNMENTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    if not isinstance(data, dict):
+        raise ValueError("Invalid schedule data")
+    conn = _assignments_db()
+    if conn is not None:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO hub_schedule_state(key,payload,updated_at) VALUES(%s,%s,%s) ON CONFLICT(key) DO UPDATE SET payload=EXCLUDED.payload,updated_at=EXCLUDED.updated_at", ("admin_assignments", json.dumps(data, ensure_ascii=False), int(datetime.now().timestamp())))
+            conn.commit()
+        finally:
+            conn.close()
+    else:
+        tmp = ASSIGNMENTS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, ASSIGNMENTS_FILE)
+
+
+def mutate_schedule_atomic(mutator):
+    """Serialize Telegram and web schedule writes using one PostgreSQL row lock."""
+    if not os.getenv("DATABASE_URL"):
+        # Local-only development; production must configure DATABASE_URL.
+        data = _local_assignments()
+        result = mutator(data)
+        _save_assignments(data)
+        return result
+    conn = _assignments_db()
+    try:
+        with conn.cursor() as cur:
+            initial = _local_assignments()
+            cur.execute("INSERT INTO hub_schedule_state(key,payload,updated_at) VALUES(%s,%s,%s) ON CONFLICT(key) DO NOTHING", ("admin_assignments", json.dumps(initial,ensure_ascii=False), int(datetime.now().timestamp())))
+            cur.execute("SELECT payload FROM hub_schedule_state WHERE key=%s FOR UPDATE", ("admin_assignments",))
+            data = json.loads(cur.fetchone()[0])
+            result = mutator(data)
+            cur.execute("UPDATE hub_schedule_state SET payload=%s,updated_at=%s WHERE key=%s", (json.dumps(data,ensure_ascii=False),int(datetime.now().timestamp()),"admin_assignments"))
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def update_schedule_record_atomic(uid: str, day: str, expected: dict, changes: dict):
+    """Compare-and-swap one record under a PostgreSQL row lock.
+
+    Prevents simultaneous web edits from silently replacing one another.
+    Telegram callbacks using legacy load/save still need migration to this API.
+    """
+    import copy
+    if not os.getenv("DATABASE_URL"):
+        raise RuntimeError("PostgreSQL required for safe web edits")
+    conn = _assignments_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT payload FROM hub_schedule_state WHERE key=%s FOR UPDATE", ("admin_assignments",))
+            row = cur.fetchone()
+            if row is None:
+                initial = _local_assignments()
+                cur.execute("INSERT INTO hub_schedule_state(key,payload,updated_at) VALUES(%s,%s,%s)", ("admin_assignments", json.dumps(initial,ensure_ascii=False), int(datetime.now().timestamp())))
+                data = initial
+            else:
+                data = json.loads(row[0])
+            actual = data.get(uid, {}).get(day, {})
+            if actual != expected:
+                conn.rollback()
+                return None
+            rec = copy.deepcopy(actual)
+            rec.update(changes)
+            data.setdefault(uid, {})[day] = rec
+            cur.execute("UPDATE hub_schedule_state SET payload=%s, updated_at=%s WHERE key=%s", (json.dumps(data,ensure_ascii=False),int(datetime.now().timestamp()),"admin_assignments"))
+        conn.commit()
+        return rec
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _known_users() -> list[dict]:
@@ -1469,10 +1734,11 @@ async def admin_select_day(callback: CallbackQuery):
 async def admin_toggle_duty(callback: CallbackQuery):
     if not is_schedule_admin(callback.from_user.id): return
     _, _, uid, short, duty = callback.data.split("_", 4); day = _day_from_short(short)
-    data = _load_assignments(); rec = _day_record(data, uid, day); rec["off"] = False; rec["always"] = False
-    if duty in rec["duties"]: rec["duties"].remove(duty)
-    else: rec["duties"].append(duty)
-    _save_assignments(data); await callback.answer("Сохранено")
+    def change(data):
+        rec = _day_record(data, uid, day); rec["off"] = False; rec["always"] = False
+        if duty in rec["duties"]: rec["duties"].remove(duty)
+        else: rec["duties"].append(duty)
+    mutate_schedule_atomic(change); await callback.answer("Сохранено")
     await callback.message.edit_text(_day_text(uid, day), reply_markup=admin_day_keyboard(uid, day), parse_mode="HTML")
 
 
@@ -1480,8 +1746,9 @@ async def admin_toggle_duty(callback: CallbackQuery):
 async def admin_toggle_off(callback: CallbackQuery):
     if not is_schedule_admin(callback.from_user.id): return
     _, _, uid, short = callback.data.split("_", 3); day = _day_from_short(short)
-    data = _load_assignments(); rec = _day_record(data, uid, day); rec["always"] = False; rec["off"] = not rec.get("off", False)
-    _save_assignments(data); await callback.answer("Выходной изменён")
+    def change(data):
+        rec = _day_record(data, uid, day); rec["always"] = False; rec["off"] = not rec.get("off", False)
+    mutate_schedule_atomic(change); await callback.answer("Выходной изменён")
     await callback.message.edit_text(_day_text(uid, day), reply_markup=admin_day_keyboard(uid, day), parse_mode="HTML")
 
 
@@ -1489,7 +1756,7 @@ async def admin_toggle_off(callback: CallbackQuery):
 async def admin_clear_day(callback: CallbackQuery):
     if not is_schedule_admin(callback.from_user.id): return
     _, _, uid, short = callback.data.split("_", 3); day = _day_from_short(short)
-    data = _load_assignments(); data.setdefault(uid, {})[day] = {"off": False, "start": "", "end": "", "duties": []}; _save_assignments(data)
+    mutate_schedule_atomic(lambda data: data.setdefault(uid, {}).__setitem__(day, {"off": False, "start": "", "end": "", "duties": []}))
     await callback.answer("День очищен")
     await callback.message.edit_text(_day_text(uid, day), reply_markup=admin_day_keyboard(uid, day), parse_mode="HTML")
 
@@ -1513,7 +1780,7 @@ async def admin_set_hours_finish(message: Message, state: FSMContext):
         if not m:
             await message.answer("❌ Неверный формат. Пример: <code>18:00-23:00</code>", parse_mode="HTML"); return
         start = f"{int(m.group(1)):02d}:{m.group(2)}"; end = f"{int(m.group(3)):02d}:{m.group(4)}"
-    data = _load_assignments(); rec = _day_record(data, uid, day); rec.update({"start": start, "end": end, "off": False, "always": False}); _save_assignments(data)
+    mutate_schedule_atomic(lambda data: _day_record(data, uid, day).update({"start": start, "end": end, "off": False, "always": False}))
     await state.clear(); await message.answer("✅ Рабочие часы сохранены.\n\n" + _day_text(uid, day), reply_markup=admin_day_keyboard(uid, day), parse_mode="HTML")
 
 
@@ -1521,13 +1788,10 @@ async def admin_set_hours_finish(message: Message, state: FSMContext):
 async def admin_set_247(callback: CallbackQuery):
     if not is_schedule_admin(callback.from_user.id): return
     uid = callback.data[8:]
-    data = _load_assignments()
-    for day in WEEKDAYS:
-        data.setdefault(str(uid), {})[day] = {
-            "off": False, "start": "", "end": "",
-            "duties": ["owner_tech"], "always": True
-        }
-    _save_assignments(data)
+    def change(data):
+        for day in WEEKDAYS:
+            data.setdefault(str(uid), {})[day] = {"off": False, "start": "", "end": "", "duties": ["owner_tech"], "always": True}
+    mutate_schedule_atomic(change)
     await callback.answer("Обязанность установлена")
     await callback.message.answer(
         f"♾ <b>{_user_label(uid)}</b> назначен на режим <b>24/7</b>.\n"
@@ -1568,8 +1832,8 @@ async def admin_delete_schedule(callback: CallbackQuery):
         for i in range(sh.max_row,1,-1):
             if str(sh.cell(i,1).value)==str(uid): sh.delete_rows(i)
         wb.save(SCHEDULE_FILE)
-    data=_load_assignments(); data.pop(str(uid),None); _save_assignments(data)
-    tz=_load_timezones(); tz.pop(str(uid),None); _save_timezones(tz)
+    mutate_schedule_atomic(lambda data: data.pop(str(uid), None))
+    _delete_timezone(uid)
     await callback.answer("График удалён")
     await callback.message.answer(f"🗑 График <b>{_user_label(uid)}</b> полностью удалён. Пользователь может заполнить его заново.",parse_mode="HTML")
 

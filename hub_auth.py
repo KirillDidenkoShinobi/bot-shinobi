@@ -193,3 +193,23 @@ def oidc_session_create(uid,ip=''):
     _execute('INSERT INTO hub_sessions(digest,uid,expires,revoked,last_seen) VALUES(?,?,?,NULL,?)',(hashlib.sha256(session.encode()).hexdigest(),int(uid),int(time.time())+SESSION_MAX_AGE,int(time.time())))
     audit(uid,'oidc_login',ip)
     return session
+
+
+def active_sessions():
+    init()
+    now=int(time.time())
+    with LOCK:
+        c,ph=_db()
+        try:
+            cur=c.cursor()
+            cur.execute('SELECT uid,expires,last_seen FROM hub_sessions WHERE revoked IS NULL AND expires>? AND COALESCE(last_seen,expires-?)>? ORDER BY last_seen DESC'.replace('?',ph),(now,SESSION_MAX_AGE,now-IDLE_TIMEOUT))
+            rows=cur.fetchall()
+        finally:c.close()
+    return [{'uid':int(uid),'role':role(uid) or 'disabled','expires':int(expires),'last_seen':int(last_seen or 0)} for uid,expires,last_seen in rows]
+
+def revoke_other_sessions(owner_uid,current_token):
+    init()
+    digest=hashlib.sha256(current_token.encode()).hexdigest() if current_token else ''
+    now=int(time.time())
+    _execute('UPDATE hub_sessions SET revoked=? WHERE revoked IS NULL AND digest<>?',(now,digest))
+    audit(owner_uid,'other_sessions_revoked')
