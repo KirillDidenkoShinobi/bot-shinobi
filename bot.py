@@ -3105,15 +3105,15 @@ def _join_request_keyboard(chat_id: int, user_id: int):
 
 
 def _join_request_text(req: dict) -> str:
-    username = f"@{req['username']}" if req.get("username") else "—"
+    username = f"@{html.escape(str(req['username']))}" if req.get("username") else "—"
     source = req.get("link_source") or invite_source_text(req.get("invite_link", ""))
     return (
         "📩 <b>НОВАЯ ЗАЯВКА НА ВСТУПЛЕНИЕ</b>\n\n"
-        f"👤 {req.get('name', 'Без имени')}\n"
+        f"👤 {html.escape(str(req.get('name', 'Без имени')))}\n"
         f"🔹 {username}\n"
         f"🆔 <code>{req.get('user_id')}</code>\n"
-        f"🏘 Группа: <b>{req.get('chat_title', 'Shinobi Team')}</b>\n"
-        f"🔗 Источник: <b>{source}</b>\n\n"
+        f"🏘 Группа: <b>{html.escape(str(req.get('chat_title', 'Shinobi Team')))}</b>\n"
+        f"🔗 Источник: <b>{html.escape(str(source))}</b>\n\n"
         "Решение синхронизируется для всех администраторов."
     )
 
@@ -3123,7 +3123,7 @@ def _join_request_result_text(req: dict) -> str:
     result = "✅ ПРИНЯТА" if status == "approved" else "❌ ОТКЛОНЕНА"
     who = req.get("decided_by_name") or str(req.get("decided_by") or "Администратор")
     where = req.get("decided_in") or "Telegram"
-    return _join_request_text(req) + f"\n\n<b>{result}</b>\nРешение: {who}\nГде принято: {where}"
+    return _join_request_text(req) + f"\n\n<b>{result}</b>\nРешение: {html.escape(str(who))}\nГде принято: {html.escape(str(where))}"
 
 
 async def _sync_join_request_messages(req: dict):
@@ -3174,8 +3174,9 @@ async def join_request_handler(event: ChatJoinRequest):
     existing = data.setdefault("pending_join_requests", {}).get(key)
     # Telegram/несколько update-путей могут прислать одно событие повторно.
     # Пока заявка активна, второй комплект карточек НЕ создаём.
-    if existing and existing.get("status") == "pending":
+    if existing and existing.get("status") == "pending" and any(m.get("place") == "staff" for m in (existing.get("messages") or [])):
         return
+    # Если старая заявка была сохранена, но уведомление не дошло — отправляем повторно.
 
     invite_url = event.invite_link.invite_link if event.invite_link else ""
     link_info = data.get("links", {}).get(invite_url, {})
@@ -3219,23 +3220,30 @@ async def join_request_handler(event: ChatJoinRequest):
     text = _join_request_text(req)
     kb = _join_request_keyboard(event.chat.id, event.from_user.id)
 
-    # Ровно одна карточка каждому уникальному админу в ЛС.
-    for admin_id in sorted(set(ADMIN_IDS)):
+    # В первую очередь Staff: не позволяем ошибкам личных сообщений мешать заявкам.
+    async def _deliver(chat_id, place):
         try:
-            msg = await bot.send_message(admin_id, text, reply_markup=kb, parse_mode="HTML")
-            req["messages"].append({"chat_id": admin_id, "message_id": msg.message_id, "place": "dm"})
+            msg = await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+            req["messages"].append({"chat_id": chat_id, "message_id": msg.message_id, "place": place})
+            return
         except Exception as exc:
             import logging
-            logging.getLogger("shinobi.delivery").error("Заявка: ЛС админу %s: %s", admin_id, exc)
-            req.setdefault("delivery_errors", []).append(f"ЛС {admin_id}: {str(exc)[:160]}")
-    # И ровно одна карточка в Staff.
-    try:
-        msg = await bot.send_message(ADMIN_STAFF_CHAT_ID, text, reply_markup=kb, parse_mode="HTML")
-        req["messages"].append({"chat_id": ADMIN_STAFF_CHAT_ID, "message_id": msg.message_id, "place": "staff"})
-    except Exception as exc:
-        import logging
-        logging.getLogger("shinobi.delivery").error("Заявка: Staff %s: %s", ADMIN_STAFF_CHAT_ID, exc)
-        req.setdefault("delivery_errors", []).append(f"Staff: {str(exc)[:160]}")
+            logging.getLogger("shinobi.delivery").exception("Ошибка отправки заявки в %s (%s)", place, chat_id)
+            req.setdefault("delivery_errors", []).append(f"{place} {chat_id}: {str(exc)[:160]}")
+        # Резервный вариант: убираем HTML, но сохраняем кнопки управления.
+        try:
+            import re
+            plain = re.sub(r"<[^>]*>", "", text)
+            msg = await bot.send_message(chat_id, html.unescape(plain), reply_markup=kb)
+            req["messages"].append({"chat_id": chat_id, "message_id": msg.message_id, "place": place})
+        except Exception as exc:
+            import logging
+            logging.getLogger("shinobi.delivery").exception("Не удалось доставить даже обычный текст заявки в %s (%s)", place, chat_id)
+            req.setdefault("delivery_errors", []).append(f"fallback {place} {chat_id}: {str(exc)[:160]}")
+
+    await _deliver(ADMIN_STAFF_CHAT_ID, "staff")
+    for admin_id in sorted(set(ADMIN_IDS)):
+        await _deliver(admin_id, "dm")
     save_data()
 
 
