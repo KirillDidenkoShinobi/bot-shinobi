@@ -36,14 +36,50 @@ def init():
     try:_execute('ALTER TABLE hub_sessions ADD COLUMN last_seen BIGINT')
     except Exception:pass
     _execute('CREATE TABLE IF NOT EXISTS hub_oidc_states (digest TEXT PRIMARY KEY, verifier TEXT NOT NULL, expires BIGINT NOT NULL, consumed BIGINT)')
+    _execute('CREATE TABLE IF NOT EXISTS hub_staff_roles (uid BIGINT PRIMARY KEY, role TEXT NOT NULL, updated_at BIGINT NOT NULL)')
+    _execute('CREATE TABLE IF NOT EXISTS hub_staff_roles (uid BIGINT PRIMARY KEY, role TEXT NOT NULL, updated_at BIGINT NOT NULL)')
     _execute('CREATE TABLE IF NOT EXISTS hub_login_audit (id BIGINT PRIMARY KEY, uid BIGINT NOT NULL, event TEXT NOT NULL, at BIGINT NOT NULL, ip TEXT)')
 
 def role(uid):
     uid=str(uid)
-    if uid in ('1197818066', *os.getenv('HUB_OWNER_IDS','').replace(' ','').split(',')):return 'owner'
+    # The owner is anchored to the deployment configuration; site operators cannot elevate themselves.
+    if uid in [x.strip() for x in os.getenv('HUB_OWNER_IDS','1197818066').split(',') if x.strip()]:
+        return 'owner'
+    init()
+    record=_execute('SELECT role FROM hub_staff_roles WHERE uid=?',(int(uid),),fetch=True)
+    if record:
+        return None if record[0]=='disabled' else record[0]
     for role_name, env in [('deputy','HUB_DEPUTY_IDS'),('admin','HUB_ADMIN_IDS'),('moderator','HUB_MODERATOR_IDS')]:
-        if uid in os.getenv(env,'').replace(' ','').split(','):return role_name
+        if uid in [x.strip() for x in os.getenv(env,'').split(',') if x.strip()]:return role_name
     return None
+
+def staff_list():
+    init()
+    ids=set()
+    for key in ('HUB_OWNER_IDS','HUB_DEPUTY_IDS','HUB_ADMIN_IDS','HUB_MODERATOR_IDS'):
+        ids.update(int(x.strip()) for x in os.getenv(key,'').split(',') if x.strip().isdigit())
+    with LOCK:
+        c,ph=_db()
+        try:
+            cur=c.cursor();cur.execute('SELECT uid FROM hub_staff_roles');ids.update(int(row[0]) for row in cur.fetchall())
+        finally:c.close()
+    return [{'uid':uid,'role':role(uid) or 'disabled'} for uid in sorted(ids)]
+
+def set_staff_role(uid,new_role):
+    init()
+    if new_role not in ('deputy','admin','moderator','disabled'):raise ValueError('invalid role')
+    if str(uid) in [x.strip() for x in os.getenv('HUB_OWNER_IDS','1197818066').split(',')]:raise ValueError('owner is managed in Railway')
+    # Explicit override wins over legacy environment roles.
+    with LOCK:
+        c,ph=_db()
+        try:
+            cur=c.cursor()
+            cur.execute('DELETE FROM hub_staff_roles WHERE uid=?'.replace('?',ph),(int(uid),))
+            cur.execute('INSERT INTO hub_staff_roles(uid,role,updated_at) VALUES(?,?,?)'.replace('?',ph),(int(uid),new_role,int(time.time())))
+            cur.execute('UPDATE hub_sessions SET revoked=? WHERE uid=? AND revoked IS NULL'.replace('?',ph),(int(time.time()),int(uid)))
+            c.commit()
+        finally:c.close()
+    audit(uid,'role_changed_'+new_role)
 
 def audit(uid,event,ip=''):
     try:_execute('INSERT INTO hub_login_audit(id,uid,event,at,ip) VALUES(?,?,?,?,?)',(secrets.randbits(62),int(uid),event,int(time.time()),str(ip)[:100]))
