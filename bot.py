@@ -3218,6 +3218,13 @@ async def join_request_handler(event: ChatJoinRequest):
     async with lock:
         existing = data.setdefault("pending_join_requests", {}).get(key)
         if existing:
+            # A pending application is one logical request, even if Telegram emits
+            # another event timestamp. Never create a second Staff card for it.
+            if existing.get("status") == "pending":
+                logging.getLogger("shinobi.join").warning(
+                    "[JOIN REQUEST DUPLICATE PENDING] user=%s request=%s",
+                    event.from_user.id, existing.get("request_id"))
+                return
             previous_stamp = existing.get("event_stamp")
             if previous_stamp is None:
                 # Legacy records have no Telegram event timestamp. A new application
@@ -3240,79 +3247,79 @@ async def join_request_handler(event: ChatJoinRequest):
                 "[JOIN REQUEST NEW CYCLE] user=%s previous_status=%s old=%s new=%s",
                 event.from_user.id, existing.get("status"), previous_stamp, event_stamp)
 
-    invite_url = event.invite_link.invite_link if event.invite_link else ""
-    link_info = data.get("links", {}).get(invite_url, {})
-    req = {
-        "chat_id": event.chat.id,
-        "chat_title": event.chat.title or "Shinobi Team",
-        "user_id": event.from_user.id,
-        "name": event.from_user.full_name,
-        "username": event.from_user.username or "",
-        "invite_link": invite_url,
-        "link_owner_id": link_info.get("owner_id"),
-        "link_source": invite_source_text(invite_url),
-        "created": datetime.now().isoformat(),
-        "event_stamp": event_stamp,
-        "request_id": f"{event_stamp:x}",
-        "status": "pending",
-        "messages": []
-    }
-    # Claim the event before the first await; a duplicate update now sees its stamp.
-    data["pending_join_requests"][key] = req
-    save_data()
-    # Проверка ЧС/бана перед обработкой заявки. Telegram не хранит публичную
-    # текстовую причину бана, поэтому фиксируем доступную техническую причину.
-    try:
-        member = await bot.get_chat_member(event.chat.id, event.from_user.id)
-        if getattr(member, "status", "") == "kicked":
-            req["status"] = "declined"
-            req["entry_block_reason"] = "Пользователь находится в ЧС (заблокирован в чате)."
-            req["decided_by_name"] = "🤖 Бот — проверка входа"
-            req["decided_at"] = datetime.now().isoformat()
-            req["decided_in"] = "Проверка ЧС"
-            data["pending_join_requests"][key] = req
-            save_data()
+        invite_url = event.invite_link.invite_link if event.invite_link else ""
+        link_info = data.get("links", {}).get(invite_url, {})
+        req = {
+            "chat_id": event.chat.id,
+            "chat_title": event.chat.title or "Shinobi Team",
+            "user_id": event.from_user.id,
+            "name": event.from_user.full_name,
+            "username": event.from_user.username or "",
+            "invite_link": invite_url,
+            "link_owner_id": link_info.get("owner_id"),
+            "link_source": invite_source_text(invite_url),
+            "created": datetime.now().isoformat(),
+            "event_stamp": event_stamp,
+            "request_id": f"{event_stamp:x}",
+            "status": "pending",
+            "messages": []
+        }
+        # Claim the event before the first await; a duplicate update now sees its stamp.
+        data["pending_join_requests"][key] = req
+        save_data()
+        # Проверка ЧС/бана перед обработкой заявки. Telegram не хранит публичную
+        # текстовую причину бана, поэтому фиксируем доступную техническую причину.
+        try:
+            member = await bot.get_chat_member(event.chat.id, event.from_user.id)
+            if getattr(member, "status", "") == "kicked":
+                req["status"] = "declined"
+                req["entry_block_reason"] = "Пользователь находится в ЧС (заблокирован в чате)."
+                req["decided_by_name"] = "🤖 Бот — проверка входа"
+                req["decided_at"] = datetime.now().isoformat()
+                req["decided_in"] = "Проверка ЧС"
+                data["pending_join_requests"][key] = req
+                save_data()
+                try:
+                    await bot.decline_chat_join_request(event.chat.id, event.from_user.id)
+                except Exception:
+                    pass
+                return
+        except Exception as exc:
+            req["entry_check_note"] = f"Не удалось проверить статус до решения: {exc}"
+
+        data["pending_join_requests"][key] = req
+        save_data()
+        # Независимый таймер: через 10 минут примет только всё ещё pending-заявку.
+        asyncio.create_task(_auto_approve_join_request(event.chat.id, event.from_user.id, req["request_id"]))
+        text = _join_request_text(req)
+        kb = _join_request_keyboard(event.chat.id, event.from_user.id, req["request_id"])
+
+        # В первую очередь Staff: не позволяем ошибкам личных сообщений мешать заявкам.
+        async def _deliver(chat_id, place):
             try:
-                await bot.decline_chat_join_request(event.chat.id, event.from_user.id)
-            except Exception:
-                pass
-            return
-    except Exception as exc:
-        req["entry_check_note"] = f"Не удалось проверить статус до решения: {exc}"
+                msg = await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+                req["messages"].append({"chat_id": chat_id, "message_id": msg.message_id, "place": place})
+                save_data()
+                logging.getLogger("shinobi.join").warning("[JOIN REQUEST DELIVERED] place=%s chat=%s user=%s", place, chat_id, event.from_user.id)
+                return
+            except Exception as exc:
+                logging.getLogger("shinobi.delivery").exception("Ошибка отправки заявки в %s (%s)", place, chat_id)
+                req.setdefault("delivery_errors", []).append(f"{place} {chat_id}: {str(exc)[:160]}")
+            # Резервный вариант: убираем HTML, но сохраняем кнопки управления.
+            try:
+                import re
+                plain = re.sub(r"<[^>]*>", "", text)
+                msg = await bot.send_message(chat_id, html.unescape(plain), reply_markup=kb)
+                req["messages"].append({"chat_id": chat_id, "message_id": msg.message_id, "place": place})
+                save_data()
+            except Exception as exc:
+                logging.getLogger("shinobi.delivery").exception("Не удалось доставить даже обычный текст заявки в %s (%s)", place, chat_id)
+                req.setdefault("delivery_errors", []).append(f"fallback {place} {chat_id}: {str(exc)[:160]}")
 
-    data["pending_join_requests"][key] = req
-    save_data()
-    # Независимый таймер: через 10 минут примет только всё ещё pending-заявку.
-    asyncio.create_task(_auto_approve_join_request(event.chat.id, event.from_user.id, req["request_id"]))
-    text = _join_request_text(req)
-    kb = _join_request_keyboard(event.chat.id, event.from_user.id, req["request_id"])
-
-    # В первую очередь Staff: не позволяем ошибкам личных сообщений мешать заявкам.
-    async def _deliver(chat_id, place):
-        try:
-            msg = await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
-            req["messages"].append({"chat_id": chat_id, "message_id": msg.message_id, "place": place})
-            logging.getLogger("shinobi.join").warning("[JOIN REQUEST DELIVERED] place=%s chat=%s user=%s", place, chat_id, event.from_user.id)
-            return
-        except Exception as exc:
-            import logging
-            logging.getLogger("shinobi.delivery").exception("Ошибка отправки заявки в %s (%s)", place, chat_id)
-            req.setdefault("delivery_errors", []).append(f"{place} {chat_id}: {str(exc)[:160]}")
-        # Резервный вариант: убираем HTML, но сохраняем кнопки управления.
-        try:
-            import re
-            plain = re.sub(r"<[^>]*>", "", text)
-            msg = await bot.send_message(chat_id, html.unescape(plain), reply_markup=kb)
-            req["messages"].append({"chat_id": chat_id, "message_id": msg.message_id, "place": place})
-        except Exception as exc:
-            import logging
-            logging.getLogger("shinobi.delivery").exception("Не удалось доставить даже обычный текст заявки в %s (%s)", place, chat_id)
-            req.setdefault("delivery_errors", []).append(f"fallback {place} {chat_id}: {str(exc)[:160]}")
-
-    await _deliver(ADMIN_STAFF_CHAT_ID, "staff")
-    for admin_id in sorted(set(ADMIN_IDS)):
-        await _deliver(admin_id, "dm")
-    save_data()
+        await _deliver(ADMIN_STAFF_CHAT_ID, "staff")
+        for admin_id in sorted(set(ADMIN_IDS)):
+            await _deliver(admin_id, "dm")
+        save_data()
 
 
 @dp.message(Command("resend_join"))
