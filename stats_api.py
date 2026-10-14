@@ -564,7 +564,7 @@ async def oidc_callback(request):
         claims=jwt.decode(encoded,key,algorithms=['RS256'],audience=client_id,issuer=discovery['issuer'],options={'require':['exp','iat','iss','aud','sub']},leeway=30)
         uid=int(claims['sub'])
         session=hub_auth.oidc_session_create(uid,request.remote or '')
-        if not session:return web.Response(text='У вас нет доступа к панели Shinobi Team.',status=403)
+        if not session:return web.Response(text='Доступ запрещён: этот Telegram-аккаунт не назначен сотрудником Shinobi Team. Проверьте Telegram ID аккаунта и HUB_OWNER_IDS в Railway. Подробности — в Railway Logs ([HUB OIDC ACCESS DENIED]).',status=403,content_type='text/plain',charset='utf-8')
     except Exception as exc:
         print('[TELEGRAM OIDC LOGIN ERROR]',type(exc).__name__,str(exc)[:150])
         return web.Response(text='Не удалось подтвердить вход через Telegram. Попробуйте ещё раз.',status=403)
