@@ -3098,11 +3098,12 @@ def _join_request_key(chat_id: int, user_id: int) -> str:
 _join_request_locks = {}
 
 
-def _join_request_keyboard(chat_id: int, user_id: int):
+def _join_request_keyboard(chat_id: int, user_id: int, request_id: str = ""):
+    suffix = f":{request_id}" if request_id else ""
     # Telegram inline keyboard: clean, readable labels without decorative emoji.
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Принять", callback_data=f"jr_accept:{chat_id}:{user_id}"),
-        InlineKeyboardButton(text="Отклонить", callback_data=f"jr_decline:{chat_id}:{user_id}")
+        InlineKeyboardButton(text="Принять", callback_data=f"jr_accept:{chat_id}:{user_id}{suffix}"),
+        InlineKeyboardButton(text="Отклонить", callback_data=f"jr_decline:{chat_id}:{user_id}{suffix}")
     ]])
 
 
@@ -3171,14 +3172,14 @@ async def _sync_join_request_messages(req: dict):
             pass
 
 
-async def _auto_approve_join_request(chat_id: int, user_id: int, delay: int = 10 * 60):
+async def _auto_approve_join_request(chat_id: int, user_id: int, request_id: str, delay: int = 10 * 60):
     """Автоматически принимает заявку, если администрация не решила её за delay секунд."""
     await asyncio.sleep(delay)
     key = _join_request_key(chat_id, user_id)
     lock = _join_request_locks.setdefault(key, asyncio.Lock())
     async with lock:
         req = data.setdefault("pending_join_requests", {}).get(key)
-        if not req or req.get("status") != "pending":
+        if not req or req.get("status") != "pending" or req.get("request_id", "") != request_id:
             return
         try:
             await bot.approve_chat_join_request(chat_id, user_id)
@@ -3210,48 +3211,34 @@ async def join_request_handler(event: ChatJoinRequest):
         )
         return
     key = _join_request_key(event.chat.id, event.from_user.id)
-    existing = data.setdefault("pending_join_requests", {}).get(key)
-    if existing:
-        # A Staff message ID returned by Telegram is an acknowledgement of delivery.
-        # Repeated Telegram updates must not create another Staff card.
-        staff_messages = [item for item in (existing.get("messages") or [])
-                          if str(item.get("chat_id")) == str(ADMIN_STAFF_CHAT_ID)]
-        if existing.get("status") != "pending":
+    # Telegram may redeliver the same update. Use the event's own timestamp to
+    # distinguish a genuine new application from a retry, even for the same user.
+    event_stamp = int(event.date.timestamp())
+    lock = _join_request_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        existing = data.setdefault("pending_join_requests", {}).get(key)
+        if existing:
+            previous_stamp = existing.get("event_stamp")
+            if previous_stamp is None:
+                # Legacy records have no Telegram event timestamp. A new application
+                # after a resolved record is a new cycle; pending legacy records are
+                # treated conservatively until a new event is confirmed.
+                try:
+                    previous_stamp = int(datetime.fromisoformat(existing["created"]).timestamp())
+                except (ValueError, TypeError, KeyError):
+                    previous_stamp = event_stamp
+            is_new_cycle = event_stamp > int(previous_stamp)
+            if not is_new_cycle:
+                logging.getLogger("shinobi.join").warning(
+                    "[JOIN REQUEST DUPLICATE] user=%s event_stamp=%s previous=%s",
+                    event.from_user.id, event_stamp, previous_stamp)
+                return
+            # Archive the previous cycle before replacing the active index.
+            data.setdefault("join_request_history", []).append(dict(existing))
+            data["join_request_history"] = data["join_request_history"][-5000:]
             logging.getLogger("shinobi.join").warning(
-                "[JOIN REQUEST DUPLICATE] user=%s status=%s; no new card",
-                event.from_user.id, existing.get("status"))
-            return
-        if staff_messages:
-            logging.getLogger("shinobi.join").warning(
-                "[JOIN REQUEST DUPLICATE] user=%s staff_message=%s; no new card",
-                event.from_user.id, staff_messages[-1].get("message_id"))
-            return
-        # Previous Staff delivery failed: retry only when no Staff message exists.
-        last = existing.get("staff_retry_at")
-        try:
-            too_soon = bool(last) and (datetime.now() - datetime.fromisoformat(last)).total_seconds() < 60
-        except (ValueError, TypeError):
-            too_soon = False
-        if too_soon:
-            logging.getLogger("shinobi.join").warning("[JOIN REQUEST RETRY THROTTLED] user=%s", event.from_user.id)
-            return
-        existing["staff_retry_at"] = datetime.now().isoformat()
-        save_data()
-        try:
-            msg = await bot.send_message(
-                ADMIN_STAFF_CHAT_ID, _join_request_text(existing),
-                reply_markup=_join_request_keyboard(event.chat.id, event.from_user.id),
-                parse_mode="HTML")
-            existing.setdefault("messages", []).append({
-                "chat_id": ADMIN_STAFF_CHAT_ID, "message_id": msg.message_id, "place": "staff"})
-            logging.getLogger("shinobi.join").warning(
-                "[JOIN REQUEST STAFF RESENT] chat=%s user=%s message=%s",
-                ADMIN_STAFF_CHAT_ID, event.from_user.id, msg.message_id)
-        except Exception as exc:
-            logging.getLogger("shinobi.join").exception("[JOIN REQUEST STAFF RESEND FAILED] user=%s", event.from_user.id)
-            existing.setdefault("delivery_errors", []).append(f"staff retry: {exc}")
-        save_data()
-        return
+                "[JOIN REQUEST NEW CYCLE] user=%s previous_status=%s old=%s new=%s",
+                event.from_user.id, existing.get("status"), previous_stamp, event_stamp)
 
     invite_url = event.invite_link.invite_link if event.invite_link else ""
     link_info = data.get("links", {}).get(invite_url, {})
@@ -3265,9 +3252,14 @@ async def join_request_handler(event: ChatJoinRequest):
         "link_owner_id": link_info.get("owner_id"),
         "link_source": invite_source_text(invite_url),
         "created": datetime.now().isoformat(),
+        "event_stamp": event_stamp,
+        "request_id": f"{event_stamp:x}",
         "status": "pending",
         "messages": []
     }
+    # Claim the event before the first await; a duplicate update now sees its stamp.
+    data["pending_join_requests"][key] = req
+    save_data()
     # Проверка ЧС/бана перед обработкой заявки. Telegram не хранит публичную
     # текстовую причину бана, поэтому фиксируем доступную техническую причину.
     try:
@@ -3291,9 +3283,9 @@ async def join_request_handler(event: ChatJoinRequest):
     data["pending_join_requests"][key] = req
     save_data()
     # Независимый таймер: через 10 минут примет только всё ещё pending-заявку.
-    asyncio.create_task(_auto_approve_join_request(event.chat.id, event.from_user.id))
+    asyncio.create_task(_auto_approve_join_request(event.chat.id, event.from_user.id, req["request_id"]))
     text = _join_request_text(req)
-    kb = _join_request_keyboard(event.chat.id, event.from_user.id)
+    kb = _join_request_keyboard(event.chat.id, event.from_user.id, req["request_id"])
 
     # В первую очередь Staff: не позволяем ошибкам личных сообщений мешать заявкам.
     async def _deliver(chat_id, place):
@@ -3346,7 +3338,7 @@ async def resend_join_command(message: Message):
         await message.answer(f"Заявка уже отправлена в Staff: сообщение {staff_messages[-1].get('message_id')}. Повторная отправка не требуется.")
         return
     try:
-        sent = await bot.send_message(ADMIN_STAFF_CHAT_ID, _join_request_text(req), reply_markup=_join_request_keyboard(CHAT_ID, user_id), parse_mode="HTML")
+        sent = await bot.send_message(ADMIN_STAFF_CHAT_ID, _join_request_text(req), reply_markup=_join_request_keyboard(CHAT_ID, user_id, req.get("request_id", "")), parse_mode="HTML")
         req.setdefault("messages", []).append({"chat_id": ADMIN_STAFF_CHAT_ID, "message_id": sent.message_id, "place": "staff"})
         req["staff_retry_at"] = datetime.now().isoformat()
         save_data()
@@ -3363,14 +3355,16 @@ async def join_request_decision(callback: CallbackQuery):
     if not can_decide:
         await callback.answer("⛔ Принимать заявки могут только участники Admin Staff и администрация.", show_alert=True)
         return
-    action, chat_id_s, user_id_s = callback.data.split(":", 2)
+    parts = callback.data.split(":")
+    action, chat_id_s, user_id_s = parts[:3]
+    clicked_request_id = parts[3] if len(parts) > 3 else ""
     chat_id, user_id = int(chat_id_s), int(user_id_s)
     key = _join_request_key(chat_id, user_id)
     lock = _join_request_locks.setdefault(key, asyncio.Lock())
     async with lock:
         req = data.setdefault("pending_join_requests", {}).get(key)
-        if not req or req.get("status") != "pending":
-            await callback.answer("Эта заявка уже обработана.", show_alert=True)
+        if not req or req.get("status") != "pending" or req.get("request_id", "") != clicked_request_id:
+            await callback.answer("Эта карточка устарела или заявка уже обработана.", show_alert=True)
             # На старой/лишней карточке тоже убираем кнопки.
             try:
                 await callback.message.edit_reply_markup(reply_markup=None)
@@ -3435,7 +3429,7 @@ async def admin_join_request_open(callback: CallbackQuery):
     if not req or req.get("status") != "pending":
         await callback.answer("Заявка уже обработана.", show_alert=True)
         return
-    await callback.message.edit_text(_join_request_text(req), reply_markup=_join_request_keyboard(int(chat_id_s), int(user_id_s)), parse_mode="HTML")
+    await callback.message.edit_text(_join_request_text(req), reply_markup=_join_request_keyboard(int(chat_id_s), int(user_id_s), req.get("request_id", "")), parse_mode="HTML")
     await callback.answer()
 
 
