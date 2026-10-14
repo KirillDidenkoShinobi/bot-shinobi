@@ -3099,32 +3099,62 @@ _join_request_locks = {}
 
 
 def _join_request_keyboard(chat_id: int, user_id: int):
+    # Telegram inline keyboard: clean, readable labels without decorative emoji.
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Принять", callback_data=f"jr_accept:{chat_id}:{user_id}"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"jr_decline:{chat_id}:{user_id}")
+        InlineKeyboardButton(text="Принять", callback_data=f"jr_accept:{chat_id}:{user_id}"),
+        InlineKeyboardButton(text="Отклонить", callback_data=f"jr_decline:{chat_id}:{user_id}")
     ]])
 
 
+def _join_request_date(value) -> str:
+    if not value:
+        return "—"
+    try:
+        return datetime.fromisoformat(str(value)).strftime("%d.%m.%Y, %H:%M")
+    except (ValueError, TypeError):
+        return html.escape(str(value)[:40])
+
+
 def _join_request_text(req: dict) -> str:
-    username = f"@{html.escape(str(req['username']))}" if req.get("username") else "—"
-    source = req.get("link_source") or invite_source_text(req.get("invite_link", ""))
+    # All user-provided fields are escaped for Telegram HTML parse mode.
+    user_id = int(req.get("user_id") or 0)
+    name = html.escape(str(req.get("name") or "Без имени"))
+    username_raw = str(req.get("username") or "").lstrip("@")
+    username = "@" + html.escape(username_raw) if username_raw else "Не указан"
+    source = html.escape(str(req.get("link_source") or invite_source_text(req.get("invite_link", ""))))
+    group = html.escape(str(req.get("chat_title") or "Shinobi Team"))
+    created = _join_request_date(req.get("created"))
+    status = req.get("status", "pending")
+    status_label = {"pending": "Ожидает рассмотрения", "approved": "Принята", "declined": "Отклонена"}.get(status, "Ожидает рассмотрения")
     return (
-        "📩 <b>НОВАЯ ЗАЯВКА НА ВСТУПЛЕНИЕ</b>\n\n"
-        f"👤 {html.escape(str(req.get('name', 'Без имени')))}\n"
-        f"🔹 {username}\n"
-        f"🆔 <code>{req.get('user_id')}</code>\n"
-        f"🏘 Группа: <b>{html.escape(str(req.get('chat_title', 'Shinobi Team')))}</b>\n"
-        f"🔗 Источник: <b>{html.escape(str(source))}</b>\n\n"
-        "Решение синхронизируется для всех администраторов."
+        "<b>SHINOBI TEAM  |  STAFF SYSTEM</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>ЗАЯВКА НА ВСТУПЛЕНИЕ</b>\n"
+        f"<b>Статус:</b> {status_label}\n\n"
+        "<b>ДАННЫЕ КАНДИДАТА</b>\n"
+        f"<b>Имя:</b> <a href=\"tg://user?id={user_id}\">{name}</a>\n"
+        f"<b>Username:</b> {username}\n"
+        f"<b>Telegram ID:</b> <code>{user_id}</code>\n\n"
+        "<b>ИНФОРМАЦИЯ О ЗАЯВКЕ</b>\n"
+        f"<b>Группа:</b> {group}\n"
+        f"<b>Источник:</b> {source}\n"
+        f"<b>Время подачи:</b> {created}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<i>Решение синхронизируется между администраторами.</i>"
     )
 
 
 def _join_request_result_text(req: dict) -> str:
-    status = req.get("status")
-    result = "✅ ПРИНЯТА" if status == "approved" else "❌ ОТКЛОНЕНА"
-    who = req.get("decided_by_name") or str(req.get("decided_by") or "Администратор")
-    where = req.get("decided_in") or "Telegram"
-    return _join_request_text(req) + f"\n\n<b>{result}</b>\nРешение: {html.escape(str(who))}\nГде принято: {html.escape(str(where))}"
+    who = html.escape(str(req.get("decided_by_name") or req.get("decided_by") or "Администратор"))
+    where = html.escape(str(req.get("decided_in") or "Telegram"))
+    decided = _join_request_date(req.get("decided_at"))
+    return (
+        _join_request_text(req)
+        + "\n\n<b>РЕШЕНИЕ ПО ЗАЯВКЕ</b>\n"
+        + f"<b>Администратор:</b> {who}\n"
+        + f"<b>Место решения:</b> {where}\n"
+        + f"<b>Время решения:</b> {decided}"
+    )
 
 
 async def _sync_join_request_messages(req: dict):
@@ -3181,13 +3211,25 @@ async def join_request_handler(event: ChatJoinRequest):
         return
     key = _join_request_key(event.chat.id, event.from_user.id)
     existing = data.setdefault("pending_join_requests", {}).get(key)
-    # A previous successful API response does not prove the Staff message still exists.
-    # Do not overwrite pending request or its messages on duplicate updates.
-    if existing and existing.get("status") == "pending":
-        # Используем глобально импортированный datetime; локальный импорт ломал новые заявки.
+    if existing:
+        # A Staff message ID returned by Telegram is an acknowledgement of delivery.
+        # Repeated Telegram updates must not create another Staff card.
+        staff_messages = [item for item in (existing.get("messages") or [])
+                          if str(item.get("chat_id")) == str(ADMIN_STAFF_CHAT_ID)]
+        if existing.get("status") != "pending":
+            logging.getLogger("shinobi.join").warning(
+                "[JOIN REQUEST DUPLICATE] user=%s status=%s; no new card",
+                event.from_user.id, existing.get("status"))
+            return
+        if staff_messages:
+            logging.getLogger("shinobi.join").warning(
+                "[JOIN REQUEST DUPLICATE] user=%s staff_message=%s; no new card",
+                event.from_user.id, staff_messages[-1].get("message_id"))
+            return
+        # Previous Staff delivery failed: retry only when no Staff message exists.
         last = existing.get("staff_retry_at")
         try:
-            too_soon = last and (datetime.now() - datetime.fromisoformat(last)).total_seconds() < 60
+            too_soon = bool(last) and (datetime.now() - datetime.fromisoformat(last)).total_seconds() < 60
         except (ValueError, TypeError):
             too_soon = False
         if too_soon:
@@ -3197,13 +3239,14 @@ async def join_request_handler(event: ChatJoinRequest):
         save_data()
         try:
             msg = await bot.send_message(
-                ADMIN_STAFF_CHAT_ID,
-                _join_request_text(existing),
+                ADMIN_STAFF_CHAT_ID, _join_request_text(existing),
                 reply_markup=_join_request_keyboard(event.chat.id, event.from_user.id),
-                parse_mode="HTML",
-            )
-            existing.setdefault("messages", []).append({"chat_id": ADMIN_STAFF_CHAT_ID, "message_id": msg.message_id, "place": "staff"})
-            logging.getLogger("shinobi.join").warning("[JOIN REQUEST STAFF RESENT] chat=%s user=%s message=%s", ADMIN_STAFF_CHAT_ID, event.from_user.id, msg.message_id)
+                parse_mode="HTML")
+            existing.setdefault("messages", []).append({
+                "chat_id": ADMIN_STAFF_CHAT_ID, "message_id": msg.message_id, "place": "staff"})
+            logging.getLogger("shinobi.join").warning(
+                "[JOIN REQUEST STAFF RESENT] chat=%s user=%s message=%s",
+                ADMIN_STAFF_CHAT_ID, event.from_user.id, msg.message_id)
         except Exception as exc:
             logging.getLogger("shinobi.join").exception("[JOIN REQUEST STAFF RESEND FAILED] user=%s", event.from_user.id)
             existing.setdefault("delivery_errors", []).append(f"staff retry: {exc}")
@@ -3296,6 +3339,11 @@ async def resend_join_command(message: Message):
         return
     if req.get("status") != "pending":
         await message.answer(f"Заявка уже обработана: {req.get('status')}")
+        return
+    staff_messages = [item for item in (req.get("messages") or [])
+                      if str(item.get("chat_id")) == str(ADMIN_STAFF_CHAT_ID)]
+    if staff_messages:
+        await message.answer(f"Заявка уже отправлена в Staff: сообщение {staff_messages[-1].get('message_id')}. Повторная отправка не требуется.")
         return
     try:
         sent = await bot.send_message(ADMIN_STAFF_CHAT_ID, _join_request_text(req), reply_markup=_join_request_keyboard(CHAT_ID, user_id), parse_mode="HTML")
