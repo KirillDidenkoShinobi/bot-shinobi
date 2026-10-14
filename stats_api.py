@@ -11,6 +11,7 @@ import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from aiohttp import web
+import hub_auth
 import aiohttp
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill
@@ -175,45 +176,45 @@ def _session_secret():
     return os.getenv("SESSION_SECRET", os.getenv("SHINOBI_STATS_API_KEY", "change-me-session-secret")).encode()
 
 
-def _make_session(role):
-    payload = json.dumps({"role": role, "exp": int(time.time()) + 60 * 60 * 24 * 7}, separators=(",", ":")).encode()
-    encoded = base64.urlsafe_b64encode(payload).decode().rstrip("=")
-    sig = hmac.new(_session_secret(), encoded.encode(), hashlib.sha256).hexdigest()
-    return encoded + "." + sig
-
-
 def _read_session(request):
-    token = request.cookies.get("shinobi_session", "")
-    if "." not in token:
-        return None
-    encoded, sig = token.rsplit(".", 1)
-    good = hmac.new(_session_secret(), encoded.encode(), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(sig, good):
-        return None
-    try:
-        payload = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
-        if int(payload.get("exp", 0)) < int(time.time()):
-            return None
-        if payload.get("role") not in ("owner", "tech"):
-            return None
-        return payload
-    except Exception:
-        return None
+    return hub_auth.session(request.cookies.get("shinobi_session", ""))
 
+# GET/read operations available to staff; state-changing endpoints require elevated role.
+WRITE_ROLES = {
+    "/api/reports": {"owner", "deputy", "admin"},
+    "/api/referrals/delete": {"owner", "deputy"},
+    "/api/server-tags/assign": {"owner", "deputy", "admin"},
+    "/api/control/group-access": {"owner", "deputy"},
+    "/api/control/server-tags": {"owner", "deputy"},
+    "/api/control/auto-reactions": {"owner", "deputy"},
+    "/api/market/wallet": {"owner"},
+    "/api/backup/full": {"owner"},
+    "/api/system/version": {"owner"},
+    "/api/october-plan": {"owner", "deputy"},
+}
 
 @web.middleware
 async def auth_middleware(request, handler):
-    public = {"/", "/login", "/api/status", "/media/banner", "/media/favicon"}
+    public = {"/", "/api/status", "/media/banner", "/media/favicon", "/auth/telegram"}
     if request.path in public:
         return await handler(request)
-    if request.path.startswith("/api/"):
-        if _api_authorized(request) or _read_session(request):
-            return await handler(request)
-        return web.json_response({"error": "forbidden"}, status=403)
-    if not _read_session(request):
-        raise web.HTTPFound("/")
+    session = _read_session(request)
+    # API key is retained only for read-only server-to-server API calls.
+    api_read = request.method == 'GET' and request.path.startswith('/api/') and _api_authorized(request)
+    if not session and not api_read:
+        if request.path.startswith('/api/'):
+            return web.json_response({"error":"unauthorized"},status=401)
+        raise web.HTTPFound('/')
+    if request.method not in ('GET','HEAD','OPTIONS'):
+        if not session or session['role'] not in WRITE_ROLES.get(request.path, {'owner'}):
+            return web.json_response({"error":"forbidden: insufficient role"},status=403)
+    if request.path.startswith('/api/backup') or request.path.startswith('/api/market/wallets'):
+        if not session or session['role'] != 'owner':
+            return web.json_response({"error":"forbidden"},status=403)
+    if request.path == '/api/login-audit' or request.path == '/api/revoke-user':
+        if not session or session['role'] != 'owner':
+            return web.json_response({"error":"forbidden"},status=403)
     return await handler(request)
-
 
 SETTINGS_FILE = BASE_DIR / "project_settings.json"
 DEFAULT_SETTINGS = {
@@ -493,37 +494,41 @@ loadReports();</script><script>function toggleHubMenu(){const o=document.body.cl
 
 
 async def login_page(request):
-    if _read_session(request):
-        raise web.HTTPFound("/dashboard")
-    return web.Response(text=LOGIN_HTML.replace("__ERROR__", ""), content_type="text/html")
+    if _read_session(request):raise web.HTTPFound('/dashboard')
+    html = """<!doctype html><html lang=ru><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Shinobi Team Hub — Telegram Login</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(ellipse at 20% 10%,#bde5ff,#f8fcff 65%);font:16px system-ui;color:#24506e}.card{max-width:390px;margin:20px;padding:38px;text-align:center;border:1px solid #ffffffaa;border-radius:28px;background:#ffffffa8;box-shadow:0 18px 50px #5490b22e;backdrop-filter:blur(25px)}h1{color:#157fbe}.tip{padding:16px;border-radius:14px;background:#e5f5ff;margin-top:20px;line-height:1.65}</style><div class=card><h1>SHINOBI TEAM HUB</h1><p>Защищённый вход через Telegram</p><div class=tip>Откройте бота в Telegram, отправьте <b>/start</b> и подтвердите вход кнопкой <b>Получить ссылку на сайт</b>.<br>Ссылка действует 5 минут.</div></div></html>"""
+    return web.Response(text=html,content_type='text/html')
 
-
-async def login(request):
-    data = await request.post()
-    role = data.get("role", "")
-    password = data.get("password", "")
-    expected = os.getenv("OWNER_PASSWORD" if role == "owner" else "TECH_ADMIN_PASSWORD", "")
-    if role not in ("owner", "tech") or not expected or not secrets.compare_digest(password, expected):
-        err = '<div class="err">Неверная роль или пароль доступа.</div>'
-        return web.Response(text=LOGIN_HTML.replace("__ERROR__", err), content_type="text/html", status=401)
-    response = web.HTTPFound("/dashboard")
-    response.set_cookie("shinobi_session", _make_session(role), httponly=True, secure=True, samesite="Lax", max_age=60*60*24*7)
+async def telegram_login(request):
+    token=request.query.get('token','')
+    session=hub_auth.redeem(token,request.remote or '')
+    if not session:return web.Response(text='Ссылка недействительна, использована или срок истёк. Запросите новую через /start.',status=403)
+    response=web.HTTPFound('/dashboard')
+    response.set_cookie('shinobi_session',session,httponly=True,secure=True,samesite='Lax',max_age=43200,path='/')
     raise response
-
 
 async def logout(request):
-    response = web.HTTPFound("/")
-    response.del_cookie("shinobi_session")
+    hub_auth.revoke(request.cookies.get('shinobi_session',''),request.remote or '')
+    response=web.HTTPFound('/')
+    response.del_cookie('shinobi_session',path='/')
     raise response
 
-
 async def dashboard(request):
-    session = _read_session(request)
-    role = "👑 OWNER" if session["role"] == "owner" else "🛠 TECH ADMIN"
-    html = DASHBOARD_HTML.replace("__ROLE__", role)
-    tech_nav = '<button class="navbtn" onclick="showPage(\'octoberPage\',this);loadOctoberPlan()">📅 План на октябрь</button>' if session.get("role") == "tech" else ""
-    return web.Response(text=html.replace("__TECH_NAV__", tech_nav), content_type="text/html")
+    session=_read_session(request)
+    if not session:raise web.HTTPFound('/')
+    role=session['role']
+    html=DASHBOARD_HTML.replace('__ROLE__',f'{role.upper()} · ID {session["uid"]}')
+    tech_nav='<button class="navbtn" onclick="showPage(\'octoberPage\',this);loadOctoberPlan()">📅 План на октябрь</button>' if role in ('owner','deputy') else ''
+    return web.Response(text=html.replace('__TECH_NAV__',tech_nav),content_type='text/html')
 
+async def login_audit(request):
+    return web.json_response({'events':hub_auth.recent()})
+
+async def revoke_user_api(request):
+    body=await request.json()
+    try:uid=int(body['uid'])
+    except (KeyError,TypeError,ValueError):return web.json_response({'error':'uid required'},status=400)
+    hub_auth.revoke_user(uid)
+    return web.json_response({'ok':True,'uid':uid})
 
 async def reports(request):
     return web.json_response({"reports": list_reports()}, dumps=lambda x: json.dumps(x, ensure_ascii=False))
@@ -535,7 +540,7 @@ async def create_report_from_web(request):
     # API-key также остаётся допустимым для служебной интеграции.
     if not session and not _api_authorized(request):
         return web.json_response({"error": "forbidden"}, status=403)
-    if session and session.get("role") not in ("owner", "tech"):
+    if session and session.get("role") not in ("owner", "deputy", "admin"):
         return web.json_response({"error": "forbidden"}, status=403)
     try:
         requested_by = "web:" + (session.get("role") if session else "api")
@@ -628,7 +633,7 @@ async def referrals_api(request):
 
 async def referral_delete(request):
     session = _read_session(request)
-    if not session or session.get("role") not in ("owner", "tech"):
+    if not session or session.get("role") not in ("owner", "deputy", "admin"):
         return web.json_response({"error": "owner_or_tech_only"}, status=403)
     try:
         payload = await request.json()
@@ -714,7 +719,7 @@ def _market_wallets_write(data):
 
 async def market_wallets_api(request):
     session = _read_session(request)
-    if not session or session.get("role") not in ("owner", "tech"):
+    if not session or session.get("role") not in ("owner", "deputy", "admin"):
         return web.json_response({"error":"owner_or_tech_only"}, status=403)
     d = _bot_data_read(); wallets = _market_wallets_read(); rows=[]
     for chat_id, chat in (d.get("game_hub") or {}).items():
@@ -732,7 +737,7 @@ async def market_wallets_api(request):
 
 async def market_wallet_update(request):
     session = _read_session(request)
-    if not session or session.get("role") not in ("owner", "tech"):
+    if not session or session.get("role") not in ("owner", "deputy", "admin"):
         return web.json_response({"error":"owner_or_tech_only"}, status=403)
     try:
         payload=await request.json(); chat_id=str(int(payload.get("chat_id"))); uid=str(int(payload.get("user_id"))); amount=int(payload.get("amount")); mode=str(payload.get("mode","add"))
@@ -950,7 +955,7 @@ def _build_full_backup_zip():
 
 async def download_full_backup(request):
     session = _read_session(request)
-    if not session or session.get("role") not in ("owner", "tech"):
+    if not session or session.get("role") not in ("owner", "deputy", "admin"):
         return web.json_response({"error": "forbidden"}, status=403)
     expected = os.getenv("BACKUP_EXPORT_CODE", "").strip()
     if not expected:
@@ -1024,7 +1029,9 @@ async def chat_summary_api(request):
 async def start_stats_api():
     app = web.Application(middlewares=[auth_middleware])
     app.router.add_get("/", login_page)
-    app.router.add_post("/login", login)
+    app.router.add_get("/auth/telegram", telegram_login)
+    app.router.add_get("/api/login-audit", login_audit)
+    app.router.add_post("/api/revoke-user", revoke_user_api)
     app.router.add_get("/logout", logout)
     app.router.add_get("/dashboard", dashboard)
     app.router.add_get("/api/status", status)
