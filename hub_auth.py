@@ -30,6 +30,7 @@ def _execute(sql,args=(),fetch=False):
 def init():
     _execute('CREATE TABLE IF NOT EXISTS hub_login_tokens (digest TEXT PRIMARY KEY, uid BIGINT NOT NULL, expires BIGINT NOT NULL, consumed BIGINT)')
     _execute('CREATE TABLE IF NOT EXISTS hub_sessions (digest TEXT PRIMARY KEY, uid BIGINT NOT NULL, expires BIGINT NOT NULL, revoked BIGINT)')
+    _execute('CREATE TABLE IF NOT EXISTS hub_oidc_states (digest TEXT PRIMARY KEY, verifier TEXT NOT NULL, expires BIGINT NOT NULL, consumed BIGINT)')
     _execute('CREATE TABLE IF NOT EXISTS hub_login_audit (id BIGINT PRIMARY KEY, uid BIGINT NOT NULL, event TEXT NOT NULL, at BIGINT NOT NULL, ip TEXT)')
 
 def role(uid):
@@ -99,3 +100,33 @@ def recent(limit=100):
             cur=c.cursor();cur.execute('SELECT uid,event,at,ip FROM hub_login_audit ORDER BY at DESC LIMIT '+str(max(1,min(int(limit),500))))
             return [{'uid':r[0],'event':r[1],'at':r[2],'ip':r[3]} for r in cur.fetchall()]
         finally:c.close()
+
+
+def oidc_state_create():
+    init()
+    state=secrets.token_urlsafe(32)
+    verifier=secrets.token_urlsafe(48)
+    _execute('INSERT INTO hub_oidc_states(digest,verifier,expires,consumed) VALUES(?,?,?,NULL)',(hashlib.sha256(state.encode()).hexdigest(),verifier,int(time.time())+300))
+    return state,verifier
+
+def oidc_state_consume(state):
+    init()
+    if not state or len(state)>256:return None
+    with LOCK:
+        c,ph=_db()
+        try:
+            cur=c.cursor()
+            sql='UPDATE hub_oidc_states SET consumed=? WHERE digest=? AND consumed IS NULL AND expires>=? RETURNING verifier'
+            if ph=='%s':sql=sql.replace('?','%s')
+            cur.execute(sql,(int(time.time()),hashlib.sha256(state.encode()).hexdigest(),int(time.time())))
+            row=cur.fetchone();c.commit()
+            return row[0] if row else None
+        finally:c.close()
+
+def oidc_session_create(uid,ip=''):
+    init()
+    if not role(uid):return None
+    session=secrets.token_urlsafe(40)
+    _execute('INSERT INTO hub_sessions(digest,uid,expires,revoked) VALUES(?,?,?,NULL)',(hashlib.sha256(session.encode()).hexdigest(),int(uid),int(time.time())+43200))
+    audit(uid,'oidc_login',ip)
+    return session

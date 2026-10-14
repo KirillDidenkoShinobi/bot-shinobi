@@ -13,6 +13,8 @@ from pathlib import Path
 from aiohttp import web
 import hub_auth
 import aiohttp
+import jwt
+from urllib.parse import urlencode
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill
 from chat_summary import snapshot as chat_summary_snapshot, uptime_seconds
@@ -195,7 +197,7 @@ WRITE_ROLES = {
 
 @web.middleware
 async def auth_middleware(request, handler):
-    public = {"/", "/api/status", "/media/banner", "/media/favicon", "/auth/telegram"}
+    public = {"/", "/api/status", "/media/banner", "/media/favicon", "/auth/telegram", "/auth/telegram/start", "/auth/telegram/callback"}
     if request.path in public:
         return await handler(request)
     session = _read_session(request)
@@ -493,10 +495,83 @@ async function setOctoberDone(date,done){let r=await fetch('/api/october-plan',{
 loadReports();</script><script>function toggleHubMenu(){const o=document.body.classList.toggle('hub-menu-open');document.querySelector('.hub-menu-toggle')?.setAttribute('aria-expanded',String(o))}function closeHubMenu(){document.body.classList.remove('hub-menu-open');document.querySelector('.hub-menu-toggle')?.setAttribute('aria-expanded','false')}document.querySelectorAll('.topnav .navbtn').forEach(b=>b.addEventListener('click',closeHubMenu));document.addEventListener('keydown',e=>{if(e.key==='Escape')closeHubMenu()});</script></body></html>'''
 
 
+OIDC_DISCOVERY = 'https://oauth.telegram.org/.well-known/openid-configuration'
+
+def _oidc_settings():
+    client_id=os.getenv('TELEGRAM_CLIENT_ID','').strip()
+    client_secret=os.getenv('TELEGRAM_CLIENT_SECRET','').strip()
+    base=os.getenv('HUB_PUBLIC_URL','').strip().rstrip('/')
+    if not (client_id and client_secret and base.startswith('https://')):
+        return None
+    return client_id,client_secret,base+'/auth/telegram/callback'
+
+async def _oidc_discovery():
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as client:
+        async with client.get(OIDC_DISCOVERY) as response:
+            response.raise_for_status()
+            data=await response.json()
+    if not all(data.get(k,'').startswith('https://') for k in ('authorization_endpoint','token_endpoint','jwks_uri')):
+        raise ValueError('Invalid Telegram OIDC discovery')
+    return data
+
 async def login_page(request):
     if _read_session(request):raise web.HTTPFound('/dashboard')
-    html = """<!doctype html><html lang=ru><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Shinobi Team Hub — Telegram Login</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(ellipse at 20% 10%,#bde5ff,#f8fcff 65%);font:16px system-ui;color:#24506e}.card{max-width:390px;margin:20px;padding:38px;text-align:center;border:1px solid #ffffffaa;border-radius:28px;background:#ffffffa8;box-shadow:0 18px 50px #5490b22e;backdrop-filter:blur(25px)}h1{color:#157fbe}.tip{padding:16px;border-radius:14px;background:#e5f5ff;margin-top:20px;line-height:1.65}</style><div class=card><h1>SHINOBI TEAM HUB</h1><p>Защищённый вход через Telegram</p><div class=tip>Откройте бота в Telegram, отправьте <b>/start</b> и подтвердите вход кнопкой <b>Получить ссылку на сайт</b>.<br>Ссылка действует 5 минут.</div></div></html>"""
-    return web.Response(text=html,content_type='text/html')
+    configured=_oidc_settings() is not None
+    action='<a class="btn" href="/auth/telegram/start">✈ Войти через Telegram</a>' if configured else '<div class="tip">Авторизация ещё не настроена. Укажите TELEGRAM_CLIENT_ID, TELEGRAM_CLIENT_SECRET и HUB_PUBLIC_URL в Railway.</div>'
+    html = """<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Shinobi Team Hub — Telegram Login</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(ellipse at 20% 10%,#bde5ff,#f8fcff 65%);font:16px system-ui;color:#24506e}.card{max-width:390px;margin:20px;padding:38px;text-align:center;border:1px solid #ffffffaa;border-radius:28px;background:#ffffffa8;box-shadow:0 18px 50px #5490b22e;backdrop-filter:blur(25px)}h1{color:#157fbe}.btn{display:block;margin:25px 0 8px;padding:16px;border-radius:14px;color:white;background:#229ed9;text-decoration:none;font-weight:700;box-shadow:0 10px 24px #229ed944}.btn:hover{background:#1689c3}.tip{padding:16px;border-radius:14px;background:#e5f5ff;margin-top:20px;line-height:1.65}.note{font-size:12px;opacity:.7}</style><div class="card"><h1>SHINOBI TEAM HUB</h1><p>Защищённый вход для администрации</p>"""+action+"""<p class="note">Доступ только сотрудникам Shinobi Team. Подтвердите вход через Telegram.</p></div></html>"""
+    return web.Response(text=html,content_type='text/html',headers={'Cache-Control':'no-store'})
+
+async def oidc_start(request):
+    cfg=_oidc_settings()
+    if not cfg:return web.Response(text='Telegram Login не настроен в Railway.',status=503)
+    client_id,secret,redirect=cfg
+    try: discovery=await _oidc_discovery()
+    except Exception as exc:
+        print('[OIDC DISCOVERY ERROR]',repr(exc))
+        return web.Response(text='Не удалось подключиться к Telegram Login.',status=502)
+    state,verifier=hub_auth.oidc_state_create()
+    challenge=base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b'=').decode()
+    params={'response_type':'code','client_id':client_id,'redirect_uri':redirect,'scope':'openid profile','state':state,'code_challenge':challenge,'code_challenge_method':'S256'}
+    response=web.HTTPFound(discovery['authorization_endpoint']+'?'+urlencode(params))
+    response.set_cookie('hub_oidc_state',state,max_age=300,secure=True,httponly=True,samesite='Lax',path='/auth/telegram')
+    raise response
+
+async def oidc_callback(request):
+    cfg=_oidc_settings()
+    if not cfg:return web.Response(text='Авторизация не настроена',status=503)
+    client_id,secret,redirect=cfg
+    state=request.query.get('state','')
+    if not state or not secrets.compare_digest(state,request.cookies.get('hub_oidc_state','')):
+        return web.Response(text='Недействительное состояние авторизации. Начните вход заново.',status=403)
+    verifier=hub_auth.oidc_state_consume(state)
+    if not verifier:return web.Response(text='Запрос входа уже использован или устарел.',status=403)
+    code=request.query.get('code','')
+    if not code:return web.Response(text='Telegram не подтвердил вход.',status=403)
+    try:
+        discovery=await _oidc_discovery()
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as client:
+            async with client.post(discovery['token_endpoint'],data={'grant_type':'authorization_code','code':code,'redirect_uri':redirect,'client_id':client_id,'client_secret':secret,'code_verifier':verifier}) as r:
+                if r.status!=200:raise ValueError('Token exchange failed')
+                tokens=await r.json()
+            async with client.get(discovery['jwks_uri']) as r:
+                r.raise_for_status();jwks=await r.json()
+        encoded=tokens.get('id_token','')
+        header=jwt.get_unverified_header(encoded)
+        if header.get('alg')!='RS256':raise ValueError('Unexpected signing algorithm')
+        key_data=next((k for k in jwks['keys'] if k.get('kid')==header.get('kid') and k.get('kty')=='RSA'),None)
+        if not key_data:raise ValueError('Signing key not found')
+        key=jwt.algorithms.RSAAlgorithm.from_jwk(key_data)
+        claims=jwt.decode(encoded,key,algorithms=['RS256'],audience=client_id,issuer=discovery['issuer'],options={'require':['exp','iat','iss','aud','sub']},leeway=30)
+        uid=int(claims['sub'])
+        session=hub_auth.oidc_session_create(uid,request.remote or '')
+        if not session:return web.Response(text='У вас нет доступа к панели Shinobi Team.',status=403)
+    except Exception as exc:
+        print('[TELEGRAM OIDC LOGIN ERROR]',type(exc).__name__,str(exc)[:150])
+        return web.Response(text='Не удалось подтвердить вход через Telegram. Попробуйте ещё раз.',status=403)
+    response=web.HTTPFound('/dashboard')
+    response.del_cookie('hub_oidc_state',path='/auth/telegram')
+    response.set_cookie('shinobi_session',session,httponly=True,secure=True,samesite='Lax',max_age=43200,path='/')
+    raise response
 
 async def telegram_login(request):
     token=request.query.get('token','')
@@ -1030,6 +1105,8 @@ async def start_stats_api():
     app = web.Application(middlewares=[auth_middleware])
     app.router.add_get("/", login_page)
     app.router.add_get("/auth/telegram", telegram_login)
+    app.router.add_get("/auth/telegram/start", oidc_start)
+    app.router.add_get("/auth/telegram/callback", oidc_callback)
     app.router.add_get("/api/login-audit", login_audit)
     app.router.add_post("/api/revoke-user", revoke_user_api)
     app.router.add_get("/logout", logout)

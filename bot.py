@@ -2744,25 +2744,6 @@ def admin_keyboard():
 # /start
 # =========================================================
 
-@dp.callback_query(F.data == "hub:confirm")
-async def hub_confirm_callback(callback: CallbackQuery):
-    import hub_auth
-    from urllib.parse import quote
-    if not callback.message or callback.message.chat.type != 'private' or not hub_auth.role(callback.from_user.id):
-        await callback.answer("Доступ запрещён",show_alert=True)
-        return
-    base=os.getenv('HUB_PUBLIC_URL','').strip().rstrip('/')
-    if not base.startswith('https://'):
-        await callback.answer("Администратор не настроил HUB_PUBLIC_URL",show_alert=True)
-        return
-    token=hub_auth.issue(callback.from_user.id)
-    if not token:
-        await callback.answer("Доступ запрещён",show_alert=True)
-        return
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-    await callback.message.answer('🔐 <b>Вход в Shinobi Team Hub</b>\nСсылка одноразовая, действует 5 минут. Не пересылайте её.',parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='Открыть сайт',url=base+'/auth/telegram?token='+quote(token))]]))
-    await callback.answer('Ссылка создана')
-
 @dp.message(Command("start"))
 async def start_handler(message: Message, state: FSMContext):
 
@@ -2796,7 +2777,9 @@ async def start_handler(message: Message, state: FSMContext):
     import hub_auth
     if hub_auth.role(message.from_user.id):
         from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-        await message.answer("🔐 <b>SHINOBI TEAM HUB</b>\nДля входа на сайт подтвердите запрос кнопкой ниже.",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Подтвердить вход на сайт",callback_data="hub:confirm")]]))
+        base=os.getenv('HUB_PUBLIC_URL','').strip().rstrip('/')
+        if base.startswith('https://'):
+            await message.answer("🔐 <b>SHINOBI TEAM HUB</b>\n\nДля входа в админ-панель перейдите на сайт и нажмите <b>«Войти через Telegram»</b>. Подтверждение личности выполняется на сайте через Telegram Login.",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🌐 Перейти на сайт",url=base)]]))
 
 
 @dp.message(F.text == "📋 Мой график")
