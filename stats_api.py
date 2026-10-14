@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -179,11 +180,15 @@ def _session_secret():
 
 
 def _read_session(request):
+    if request.get("hub_session_checked"):
+        return request.get("hub_session")
     return hub_auth.session(request.cookies.get("shinobi_session", ""))
 
 # GET/read operations available to staff; state-changing endpoints require elevated role.
 WRITE_ROLES = {
     "/api/reports": {"owner", "deputy", "admin"},
+    "/api/referrals/create": {"owner", "deputy", "admin"},
+    "/api/referrals/create": {"owner", "deputy", "admin"},
     "/api/referrals/delete": {"owner", "deputy"},
     "/api/server-tags/assign": {"owner", "deputy", "admin"},
     "/api/control/group-access": {"owner", "deputy", "tech_admin"},
@@ -202,7 +207,11 @@ async def auth_middleware(request, handler):
     public = {"/", "/api/status", "/media/banner", "/media/favicon", "/auth/telegram", "/auth/telegram/start", "/auth/telegram/callback"}
     if request.path in public:
         return await handler(request)
-    session = _read_session(request)
+    # Auth uses synchronous SQLite/PostgreSQL drivers. Keep their connection and
+    # schema work off the shared event loop used by Telegram polling.
+    session = await asyncio.to_thread(hub_auth.session, request.cookies.get("shinobi_session", ""))
+    request["hub_session_checked"] = True
+    request["hub_session"] = session
     # API key is retained only for read-only server-to-server API calls.
     api_read = request.method == 'GET' and request.path.startswith('/api/') and _api_authorized(request)
     if not session and not api_read:
@@ -222,10 +231,10 @@ async def auth_middleware(request, handler):
         try:
             response = await handler(request)
             status = getattr(response, 'status', 200)
-            hub_auth.audit(session['uid'], 'api_' + request.method.lower() + '_' + request.path.replace('/', '_') + '_status_' + str(status))
+            await asyncio.to_thread(hub_auth.audit, session['uid'], 'api_' + request.method.lower() + '_' + request.path.replace('/', '_') + '_status_' + str(status))
             return response
         except Exception:
-            hub_auth.audit(session['uid'], 'api_' + request.method.lower() + '_' + request.path.replace('/', '_') + '_error')
+            await asyncio.to_thread(hub_auth.audit, session['uid'], 'api_' + request.method.lower() + '_' + request.path.replace('/', '_') + '_error')
             raise
     return await handler(request)
 
@@ -493,12 +502,17 @@ input,select,textarea{border-radius:11px!important;min-height:38px}.tab{font-wei
 .hub-search-label input{width:100%;background:#fff!important;border:1px solid #cde5f5!important;padding:12px 14px;min-height:43px}
 .hub-secondary{background:rgba(255,255,255,.9)!important;color:#1d80b8!important;border:1px solid #b9e0f5!important;box-shadow:none!important}
 .hub-secondary:hover{background:#e4f4ff!important}
+.hub-link-create{display:grid;grid-template-columns:1fr;gap:12px;margin:14px 0;padding:16px 18px;border:1px solid #b9dff3;border-radius:17px;background:rgba(231,246,255,.72)}
+.hub-link-create-controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.hub-link-create-controls input{flex:1 1 220px;padding:11px 13px}
+.hub-create-link.btn{background:linear-gradient(135deg,#ff525b,#c81020)!important;box-shadow:0 6px 18px #d7192930!important;color:#fff!important}
+.hub-create-link.btn:hover{background:linear-gradient(135deg,#f13b46,#a90b19)!important;box-shadow:0 10px 24px #d7192940!important}
 .hub-filter-hidden{display:none!important}
 #growthPage .mediaTools,#aiModPage .mediaTools{overflow-x:auto}
 #growthPage td,#aiModPage td{vertical-align:middle}
 #growthPage tbody tr,#aiModPage tbody tr{transition:background .16s ease}
 @media(max-width:650px){.hub-table-toolbar{padding:12px}.hub-table-toolbar button{flex:1 1 120px}}
-</style></head><body><header><button type="button" class="hub-menu-toggle" aria-label="Открыть разделы" aria-expanded="false" onclick="toggleHubMenu()">☰</button><div class="brand">SHINOBI <span>STATS</span></div><div class="who"><b>__ROLE__</b> • AUTHORIZED <a class="logout" href="/logout">Выйти</a></div></header><div class="hub-overlay" onclick="closeHubMenu()"></div><main><div class="eyebrow">SHINOBI TEAM • INTERNAL SYSTEM</div><div class="title">Контроль сотрудников</div><div class="muted">Отчёты и архив администрации проекта • BUILD 2026.09.27.2</div><div class="topnav"><button class="navbtn active" onclick="showPage('hubOverview',this);hubOverviewLoad()">Обзор</button><button class="navbtn" onclick="showPage('hubStaff',this);hubStaffLoad()">Сотрудники</button><button class="navbtn" onclick="showPage('hubSecurity',this);hubSecurityLoad()">Безопасность</button><button class="navbtn" onclick="showPage('hubSchedule',this);hubScheduleLoad();hubLiveLoad();hubDayoffLoad()">График и выходные</button><button class="navbtn active" onclick="showPage('reportsPage',this)">📊 Отчёты</button><button class="navbtn" onclick="showPage('projectPage',this)">🥷 О проекте</button><button class="navbtn" onclick="showPage('botPage',this)">🤖 О боте</button><button class="navbtn" onclick="showPage('controlPage',this);loadControl()">🎛 Управление</button><button class="navbtn" onclick="showPage('changesPage',this);loadChanges()">🗓 История изменений</button><button class="navbtn" onclick="showPage('chatPage',this);loadChatSummary()">💬 Сводка чатов</button><button class="navbtn" onclick="showPage('growthPage',this);loadGrowth()">📈 Приглашения и рост</button>__TECH_NAV__<button class="navbtn" onclick="showPage('aiModPage',this);loadAiModeration()">🧪 AI-модерация <b>BETA</b></button></div><div id="aiModPage" class="page"><div class="hero"><div class="eyebrow">AI MODERATION • BETA</div><h2>🧪 Журнал модерации <span style="font-size:15px;border:1px solid #e50914;padding:4px 8px;border-radius:8px">BETA</span></h2><div class="muted">AI и ручные наказания Staff в единой системе Shinobi Moderation.</div></div><div class="infoGrid"><div class="infoCard"><div class="infoLabel">СРАБАТЫВАНИЙ В ЖУРНАЛЕ</div><div class="infoValue" id="aiModCount">—</div></div><div class="infoCard"><div class="infoLabel">СТАТУС</div><div class="infoValue">🧪 BETA</div></div></div><div class="mediaTools"><h3>🛡 Последние нарушения • BETA</h3><div class="status" style="margin-bottom:12px">Показываются последние 500 применённых решений AI-модерации.</div><div class="hub-table-toolbar"><label class="hub-search-label">Поиск по нарушениям <input id="hubModFilter" type="search" placeholder="Участник, правило, причина" oninput="hubFilterTable('aiModLog',this.value)"></label><button class="btn hub-secondary" onclick="hubExportTable('aiModLog','shinobi-moderation.csv')">Экспорт CSV</button><button class="btn hub-secondary" onclick="loadAiModeration()">Обновить</button></div><div id="aiModLog"><div class="empty">Загрузка…</div></div></div></div><div id="growthPage" class="page"><div class="hero"><div class="eyebrow">SHINOBI ANALYTICS</div><h2>📈 Приглашения и рост чата</h2><div class="muted">Рейтинг реферальных ссылок, дневной прирост и история входов в основной чат.</div></div><div class="infoGrid"><div class="infoCard"><div class="infoLabel">ВОШЛО СЕГОДНЯ</div><div class="infoValue" id="joinsToday">—</div></div><div class="infoCard"><div class="infoLabel">ВОШЛО ВЧЕРА</div><div class="infoValue" id="joinsYesterday">—</div></div><div class="infoCard"><div class="infoLabel">ПРИРОСТ К ВЧЕРА</div><div class="infoValue" id="joinsDelta">—</div></div><div class="infoCard"><div class="infoLabel">ЗА 30 ДНЕЙ</div><div class="infoValue" id="joinsPeriod">—</div></div></div><div class="mediaTools"><h3>📊 График входов за 30 дней</h3><div style="height:340px"><canvas id="joinsChart"></canvas></div></div><div class="mediaTools"><h3>🏆 Ссылки по количеству приглашённых</h3><div class="status" style="margin-bottom:12px">Сортировка от большего к меньшему. Персональную ссылку можно удалить прямо здесь.</div><div class="hub-table-toolbar"><label class="hub-search-label">Поиск по ссылкам <input id="hubReferralFilter" type="search" placeholder="Имя, @username или ссылка" oninput="hubFilterTable('referralRanking',this.value)"></label><button class="btn hub-secondary" onclick="hubExportTable('referralRanking','shinobi-referrals.csv')">Экспорт CSV</button><button class="btn hub-secondary" onclick="loadGrowth()">Обновить</button></div><div id="referralRanking"><div class="empty">Загрузка…</div></div></div></div><div id="octoberPage" class="page"><div class="hero"><div class="eyebrow">TECH ADMIN • OCTOBER 2026</div><h2>📅 План на октябрь</h2><div class="muted">31 день контента MLBB. Отмечай выполненные публикации галочкой.</div></div><div class="panel"><div class="ph">Контент-план • Октябрь 2026</div><div id="octoberPlanBox"><div class="empty">Загрузка…</div></div></div></div><section class="page" id="techOpsPage"><div class="eyebrow">SHINOBI TEAM / TECHNICAL OPERATIONS</div><h1 class="title">🛠 Техническая панель</h1><p class="muted">Диагностика, группы и управление доступными настройками. Права проверяются на сервере.</p><div class="infoGrid"><div class="infoCard"><div class="infoLabel">ПОЛЬЗОВАТЕЛЕЙ</div><div class="infoValue" id="techUsers">—</div></div><div class="infoCard"><div class="infoLabel">ГРУПП</div><div class="infoValue" id="techGroups">—</div></div><div class="infoCard"><div class="infoLabel">ТЕГОВ</div><div class="infoValue" id="techTags">—</div></div></div><div class="panel"><div class="ph">Управление ботом</div><p class="muted">Настройки групп, тегов и реакций доступны в существующем разделе «Управление». Сохраняются через API, с проверкой роли.</p><div class="hub-quick"><button class="btn" onclick="hubGo('controlPage');loadControl()">Открыть управление</button><button class="btn hub-secondary" onclick="techOpsLoad()">Обновить показатели</button><button class="btn hub-secondary" onclick="hubGo('chatPage');loadChatSummary()">Сводка чатов</button><button class="btn hub-secondary" onclick="hubGo('aiModPage');loadAiModeration()">Журнал модерации</button></div><p class="status" id="techOpsStatus"></p></div></section><section class="page active" id="hubOverview"><div class="eyebrow">SHINOBI TEAM / CONTROL CENTER</div><h1 class="title">Панель управления</h1><p class="muted">Живые данные из существующих модулей Shinobi Team Hub</p><div class="infoGrid" id="hubOverviewStats"><div class="infoCard">Загружаем показатели…</div></div><div class="hub-feature-grid"><div class="panel"><div class="ph">Быстрые действия</div><div class="hub-quick"><button class="btn" onclick="hubGo('growthPage')">Приглашения</button><button class="btn" onclick="hubGo('controlPage')">Управление ботом</button><button class="btn" onclick="hubGo('chatPage')">Сводка чатов</button><button class="btn" onclick="hubGo('reportsPage')">Отчёты и графики</button></div></div><div class="panel"><div class="ph">Безопасность</div><div class="hub-quick"><p class="muted">Авторизация через Telegram, роли на сервере, выход после 30 минут бездействия.</p><a class="btn" href="/logout" style="text-decoration:none;display:inline-block">Завершить сессию</a></div></div></div></section>
+</style></head><body><header><button type="button" class="hub-menu-toggle" aria-label="Открыть разделы" aria-expanded="false" onclick="toggleHubMenu()">☰</button><div class="brand">SHINOBI <span>STATS</span></div><div class="who"><b>__ROLE__</b> • AUTHORIZED <a class="logout" href="/logout">Выйти</a></div></header><div class="hub-overlay" onclick="closeHubMenu()"></div><main><div class="eyebrow">SHINOBI TEAM • INTERNAL SYSTEM</div><div class="title">Контроль сотрудников</div><div class="muted">Отчёты и архив администрации проекта • BUILD 2026.09.27.2</div><div class="topnav"><button class="navbtn active" onclick="showPage('hubOverview',this);hubOverviewLoad()">Обзор</button><button class="navbtn" onclick="showPage('hubStaff',this);hubStaffLoad()">Сотрудники</button><button class="navbtn" onclick="showPage('hubSecurity',this);hubSecurityLoad()">Безопасность</button><button class="navbtn" onclick="showPage('hubSchedule',this);hubScheduleLoad();hubLiveLoad();hubDayoffLoad()">График и выходные</button><button class="navbtn active" onclick="showPage('reportsPage',this)">📊 Отчёты</button><button class="navbtn" onclick="showPage('projectPage',this)">🥷 О проекте</button><button class="navbtn" onclick="showPage('botPage',this)">🤖 О боте</button><button class="navbtn" onclick="showPage('controlPage',this);loadControl()">🎛 Управление</button><button class="navbtn" onclick="showPage('changesPage',this);loadChanges()">🗓 История изменений</button><button class="navbtn" onclick="showPage('chatPage',this);loadChatSummary()">💬 Сводка чатов</button><button class="navbtn" onclick="showPage('growthPage',this);loadGrowth()">📈 Приглашения и рост</button>__TECH_NAV__<button class="navbtn" onclick="showPage('aiModPage',this);loadAiModeration()">🧪 AI-модерация <b>BETA</b></button></div><div id="aiModPage" class="page"><div class="hero"><div class="eyebrow">AI MODERATION • BETA</div><h2>🧪 Журнал модерации <span style="font-size:15px;border:1px solid #e50914;padding:4px 8px;border-radius:8px">BETA</span></h2><div class="muted">AI и ручные наказания Staff в единой системе Shinobi Moderation.</div></div><div class="infoGrid"><div class="infoCard"><div class="infoLabel">СРАБАТЫВАНИЙ В ЖУРНАЛЕ</div><div class="infoValue" id="aiModCount">—</div></div><div class="infoCard"><div class="infoLabel">СТАТУС</div><div class="infoValue">🧪 BETA</div></div></div><div class="mediaTools"><h3>🛡 Последние нарушения • BETA</h3><div class="status" style="margin-bottom:12px">Показываются последние 500 применённых решений AI-модерации.</div><div class="hub-table-toolbar"><label class="hub-search-label">Поиск по нарушениям <input id="hubModFilter" type="search" placeholder="Участник, правило, причина" oninput="hubFilterTable('aiModLog',this.value)"></label><button class="btn hub-secondary" onclick="hubExportTable('aiModLog','shinobi-moderation.csv')">Экспорт CSV</button><button class="btn hub-secondary" onclick="loadAiModeration()">Обновить</button></div><div id="aiModLog"><div class="empty">Загрузка…</div></div></div></div><div id="growthPage" class="page"><div class="hero"><div class="eyebrow">SHINOBI ANALYTICS</div><h2>📈 Приглашения и рост чата</h2><div class="muted">Рейтинг реферальных ссылок, дневной прирост и история входов в основной чат.</div></div><div class="infoGrid"><div class="infoCard"><div class="infoLabel">ВОШЛО СЕГОДНЯ</div><div class="infoValue" id="joinsToday">—</div></div><div class="infoCard"><div class="infoLabel">ВОШЛО ВЧЕРА</div><div class="infoValue" id="joinsYesterday">—</div></div><div class="infoCard"><div class="infoLabel">ПРИРОСТ К ВЧЕРА</div><div class="infoValue" id="joinsDelta">—</div></div><div class="infoCard"><div class="infoLabel">ЗА 30 ДНЕЙ</div><div class="infoValue" id="joinsPeriod">—</div></div></div><div class="mediaTools"><h3>📊 График входов за 30 дней</h3><div style="height:340px"><canvas id="joinsChart"></canvas></div></div><div class="mediaTools"><h3>🏆 Ссылки по количеству приглашённых</h3><div class="status" style="margin-bottom:12px">Сортировка от большего к меньшему. Персональную ссылку можно удалить прямо здесь.</div>__LINK_CREATE__<div class="hub-table-toolbar"><label class="hub-search-label">Поиск по ссылкам <input id="hubReferralFilter" type="search" placeholder="Имя, @username или ссылка" oninput="hubFilterTable('referralRanking',this.value)"></label><button class="btn hub-secondary" onclick="hubExportTable('referralRanking','shinobi-referrals.csv')">Экспорт CSV</button><button class="btn hub-secondary" onclick="loadGrowth()">Обновить</button></div><div id="referralRanking"><div class="empty">Загрузка…</div></div></div></div><div id="octoberPage" class="page"><div class="hero"><div class="eyebrow">TECH ADMIN • OCTOBER 2026</div><h2>📅 План на октябрь</h2><div class="muted">31 день контента MLBB. Отмечай выполненные публикации галочкой.</div></div><div class="panel"><div class="ph">Контент-план • Октябрь 2026</div><div id="octoberPlanBox"><div class="empty">Загрузка…</div></div></div></div><section class="page" id="techOpsPage"><div class="eyebrow">SHINOBI TEAM / TECHNICAL OPERATIONS</div><h1 class="title">🛠 Техническая панель</h1><p class="muted">Диагностика, группы и управление доступными настройками. Права проверяются на сервере.</p><div class="infoGrid"><div class="infoCard"><div class="infoLabel">ПОЛЬЗОВАТЕЛЕЙ</div><div class="infoValue" id="techUsers">—</div></div><div class="infoCard"><div class="infoLabel">ГРУПП</div><div class="infoValue" id="techGroups">—</div></div><div class="infoCard"><div class="infoLabel">ТЕГОВ</div><div class="infoValue" id="techTags">—</div></div></div><div class="panel"><div class="ph">Управление ботом</div><p class="muted">Настройки групп, тегов и реакций доступны в существующем разделе «Управление». Сохраняются через API, с проверкой роли.</p><div class="hub-quick"><button class="btn" onclick="hubGo('controlPage');loadControl()">Открыть управление</button><button class="btn hub-secondary" onclick="techOpsLoad()">Обновить показатели</button><button class="btn hub-secondary" onclick="hubGo('chatPage');loadChatSummary()">Сводка чатов</button><button class="btn hub-secondary" onclick="hubGo('aiModPage');loadAiModeration()">Журнал модерации</button></div><p class="status" id="techOpsStatus"></p></div></section><section class="page active" id="hubOverview"><div class="eyebrow">SHINOBI TEAM / CONTROL CENTER</div><h1 class="title">Панель управления</h1><p class="muted">Живые данные из существующих модулей Shinobi Team Hub</p><div class="infoGrid" id="hubOverviewStats"><div class="infoCard">Загружаем показатели…</div></div><div class="hub-feature-grid"><div class="panel"><div class="ph">Быстрые действия</div><div class="hub-quick"><button class="btn" onclick="hubGo('growthPage')">Приглашения</button><button class="btn" onclick="hubGo('controlPage')">Управление ботом</button><button class="btn" onclick="hubGo('chatPage')">Сводка чатов</button><button class="btn" onclick="hubGo('reportsPage')">Отчёты и графики</button></div></div><div class="panel"><div class="ph">Безопасность</div><div class="hub-quick"><p class="muted">Авторизация через Telegram, роли на сервере, выход после 30 минут бездействия.</p><a class="btn" href="/logout" style="text-decoration:none;display:inline-block">Завершить сессию</a></div></div></div></section>
 <section class="page" id="hubSecurity"><div class="eyebrow">SECURITY CENTER</div><h1 class="title">Безопасность и сессии</h1><p class="muted">Только владелец. История авторизации и активные сессии сотрудников.</p><div class="infoGrid"><div class="infoCard"><div class="infoLabel">СЕССИИ</div><div class="infoValue" id="hubSessionCount">—</div></div><div class="infoCard"><div class="infoLabel">СОБЫТИЯ АВТОРИЗАЦИИ</div><div class="infoValue" id="hubAuditCount">—</div></div></div><div class="mediaTools"><h3>Активные сессии</h3><p class="status">Сессии автоматически истекают после 30 минут бездействия, максимум через 12 часов. Завершение сессии не выходит из Telegram.</p><div class="mediaRow"><button class="btn" onclick="hubSecurityLoad()">Обновить</button><button class="navbtn" onclick="hubRevokeAll()">Завершить все чужие сессии</button></div><div class="tablewrap" id="hubSessionRows" style="margin-top:16px">Загрузка…</div></div><div class="mediaTools"><h3>Журнал входов</h3><div class="mediaRow"><input id="hubAuditSearch" placeholder="Поиск по ID или событию" oninput="hubRenderAudit()" aria-label="Поиск в журнале"></div><div class="tablewrap" id="hubAuditRows" style="margin-top:16px">Загрузка…</div></div></section><section class="page" id="hubStaff"><div class="eyebrow">КОМАНДА / ДОСТУП</div><h1 class="title">Сотрудники</h1><p class="muted">Владелец может назначать роли, отключать доступ и завершать активные сессии. Изменения сохраняются в PostgreSQL.</p><div class="panel"><div class="ph">Добавить или изменить сотрудника</div><div class="hub-quick"><div class="mediaRow"><input id="hubStaffUid" inputmode="numeric" placeholder="Telegram ID сотрудника"><select id="hubStaffRole"><option value="moderator">Модератор</option><option value="admin">Администратор</option><option value="tech_admin">Технический администратор</option><option value="deputy">Заместитель</option><option value="disabled">Отключить доступ</option></select><button class="btn" onclick="hubStaffSave()">Сохранить</button></div><div id="hubStaffMsg" class="status"></div></div></div><div class="panel" style="margin-top:18px"><div class="ph">Список сотрудников</div><div id="hubStaffRows" class="tablewrap"><div class="empty">Загрузка…</div></div></div></section>
 <section class="page" id="hubSchedule"><div class="eyebrow">STAFF OPERATIONS</div><h1 class="title">График и выходные</h1><p class="muted">Живой график и заявки из общей PostgreSQL. Ниже также доступен архив XLSX-снимков для отчётности.</p><div class="infoGrid"><div class="infoCard"><div class="infoLabel">ЗАПИСЕЙ ГРАФИКА</div><div class="infoValue" id="hubScheduleCount">—</div></div><div class="infoCard"><div class="infoLabel">ЗАЯВОК НА ВЫХОДНОЙ</div><div class="infoValue" id="hubDaysOffCount">—</div></div></div><div class="panel" style="margin-top:18px"><div class="ph">Живой график обязанностей · PostgreSQL</div><p class="muted">Изменения сохраняются в общей базе и используются Telegram-ботом. Редактирование доступно владельцу и заместителю.</p><div class="mediaRow"><select id="hubLiveUser" onchange="hubLiveRender()" aria-label="Сотрудник"></select><select id="hubLiveDay" onchange="hubLiveRender()" aria-label="День недели"></select><label><input type="checkbox" id="hubLiveOff"> Выходной</label></div><div id="hubLiveDuties" class="hub-feature-grid" style="margin:12px 0"></div><div class="mediaRow"><button class="btn" onclick="hubLiveSave()">Сохранить график</button><button class="btn hub-secondary" onclick="hubLiveLoad()">Обновить данные</button></div><p class="status" id="hubLiveStatus"></p></div><div class="panel" style="margin-top:18px"><div class="ph">График сотрудников</div><div class="hub-table-toolbar"><label class="hub-search-label">Поиск по сотруднику или дню<input id="hubScheduleFilter" placeholder="Имя, ID, день недели…" oninput="hubFilterTable('hubScheduleRows',this.value)"></label><button class="btn hub-secondary" onclick="hubScheduleLoad()">Обновить</button><button class="btn hub-secondary" onclick="hubExportTable('hubScheduleRows','shinobi-schedule.csv')">Экспорт CSV</button></div><div id="hubScheduleRows" class="tablewrap"><div class="empty">Откройте раздел для загрузки</div></div></div><div class="panel" style="margin-top:18px"><div class="ph">Рассмотрение заявок · PostgreSQL</div><p class="muted">Одобрение или отклонение доступно владельцу и заместителю. Повторное решение по одной заявке блокируется.</p><div class="mediaRow"><button class="btn hub-secondary" onclick="hubDayoffLoad()">Обновить заявки</button></div><div id="hubDayoffReviewRows" class="tablewrap"><div class="empty">Нажмите «Обновить заявки»</div></div><p id="hubDayoffReviewStatus" class="status"></p></div><div class="panel" style="margin-top:18px"><div class="ph">Заявки на выходные</div><div class="hub-table-toolbar"><label class="hub-search-label">Поиск по заявкам<input id="hubDaysOffFilter" placeholder="Имя, статус, дата…" oninput="hubFilterTable('hubDaysOffRows',this.value)"></label><button class="btn hub-secondary" onclick="hubExportTable('hubDaysOffRows','shinobi-days-off.csv')">Экспорт CSV</button></div><div id="hubDaysOffRows" class="tablewrap"><div class="empty">Откройте раздел для загрузки</div></div></div><p class="status" id="hubScheduleUpdated"></p></section><div id="reportsPage" class="page active"><div class="toolbar"><button class="btn" id="newReportBtn" onclick="createNewReport()">＋ Новый отчёт</button><button class="btn" onclick="loadReports()">↻ Обновить архив</button><span class="status" id="status">Готово</span></div><div class="grid"><section class="panel"><div class="ph">Архив отчётов</div><div class="reports" id="reports"><div class="empty">Загрузка…</div></div></section><section class="panel content"><div class="ph" id="reportTitle">Выберите отчёт</div><div class="tabs" id="tabs"></div><div class="tablewrap" id="table"><div class="empty">Выберите отчёт слева</div></div></section></div></div><div id="projectPage" class="page"><div class="hero"><div class="eyebrow">SHINOBI TEAM</div><h2>О проекте</h2><div class="muted">Внутренняя система управления, отчётности и контроля Shinobi Team.</div></div><div class="infoGrid"><div class="infoCard"><div class="infoLabel">ПРОЕКТ</div><div class="infoValue" id="projectName">Shinobi Team</div></div><div class="infoCard"><div class="infoLabel">ПЛАТФОРМА</div><div class="infoValue" id="platform">MLBB</div></div><div class="infoCard"><div class="infoLabel">СРЕДА</div><div class="infoValue" id="environment">PRODUCTION</div></div><div class="infoCard"><div class="infoLabel">БАЗА ДАННЫХ</div><div class="infoValue" id="database">—</div></div></div><div id="mediaEditor"></div></div><div id="botPage" class="page"><div class="hero"><div class="eyebrow">SHINOBI SYSTEM</div><h2>О боте</h2><div class="muted">Техническая информация о текущей версии Telegram-бота.</div></div><div class="infoGrid"><div class="infoCard"><div class="infoLabel">BOT STATUS</div><div class="infoValue" style="color:#43d17a" id="botStatus">● ONLINE</div></div><div class="infoCard"><div class="infoLabel">BOT VERSION</div><div class="infoValue" id="botVersion">—</div><div id="versionEditor"></div></div><div class="infoCard"><div class="infoLabel">DATABASE</div><div class="infoValue" id="botDatabase">—</div></div><div class="infoCard"><div class="infoLabel">ACCESS ROLE</div><div class="infoValue">__ROLE__</div></div></div></div><div id="controlPage" class="page"><div class="hero"><div class="eyebrow">TELEGRAM WEB APP</div><h2>Управление ботом</h2><div class="muted">Состояние Telegram-функций, группы, пользователи и серверные теги.</div></div><div class="infoGrid"><div class="infoCard"><div class="infoLabel">ПОЛЬЗОВАТЕЛЕЙ</div><div class="infoValue" id="ctlUsers">—</div></div><div class="infoCard"><div class="infoLabel">ГРУПП</div><div class="infoValue" id="ctlGroups">—</div></div><div class="infoCard"><div class="infoLabel">ВЫДАНО ТЕГОВ</div><div class="infoValue" id="ctlTags">—</div></div><div class="infoCard"><div class="infoLabel">ТЕХ. РАБОТЫ</div><div class="infoValue" id="ctlMaint">—</div></div></div><div class="mediaTools"><h3>🎲 Автоматические реакции</h3><div class="status">Мгновенные случайные реакции на новые сообщения в основном чате. Переключение применяется без перезапуска бота (до 2 секунд).</div><div class="mediaRow" style="margin-top:12px"><button class="btn" id="autoReactionsToggle" onclick="toggleAutoReactions()">Загрузка…</button><span class="status" id="autoReactionsState"></span></div></div><div class="mediaTools"><h3>⚡ Автовыдача серверных тегов</h3><div class="status">Если выключено, бот не спрашивает сервер у новых участников, не реагирует на ответы и реакции для выдачи тегов.</div><div class="mediaRow" style="margin-top:12px"><button class="btn" id="serverTagsToggle" onclick="toggleServerTags()">Загрузка…</button><span class="status" id="serverTagsState"></span></div></div><div class="mediaTools"><h3>🏷 Серверные теги</h3><div class="status">Ручная выдача использует Telegram setChatMemberTag. Боту нужно право can_manage_tags.</div><div class="mediaRow" style="margin-top:12px"><input id="tagChat" placeholder="Chat ID"><input id="tagUser" placeholder="User ID"><select id="tagValue" style="background:#0d0d0f;color:#fff;border:1px solid #333;padding:11px;border-radius:8px"></select><button class="btn" onclick="assignTagWeb()">Выдать тег</button></div><div class="status" id="tagStatus" style="margin-top:10px">Готово</div><div id="tagHistory" style="margin-top:14px;overflow:auto"></div></div><div class="mediaTools"><h3>👤 Участники без тега</h3><div class="status">Проверяет участников ОСНОВНОГО чата, которых бот уже знает. Администраторы исключаются автоматически — их специальные теги не учитываются. Telegram Bot API не отдаёт боту полный список всех участников группы.</div><div class="mediaRow" style="margin-top:12px"><button class="btn" onclick="loadUntagged()">Обновить список</button><button class="navbtn" onclick="copyUntagged()">Копировать</button><span class="status" id="untaggedStatus">Нажмите «Обновить список»</span></div><textarea id="untaggedList" readonly style="width:100%;min-height:180px;margin-top:12px;background:#0b0b0d;color:#eee;border:1px solid #333;border-radius:8px;padding:12px;resize:vertical"></textarea></div><div class="mediaTools"><h3>💾 Полный бэкап бота</h3><div class="status">Собирает ZIP в момент запроса: актуальные файлы бота, локальные данные, отчёты, медиа и полный экспорт PostgreSQL. Для скачивания требуется отдельный резервный код.</div><div class="mediaRow" style="margin-top:12px"><button class="btn" id="backupBtn" onclick="downloadFullBackup()">Скачать актуальную версию</button><span class="status" id="backupStatus">Готово</span></div></div><div class="mediaTools" id="marketWalletPanel"><h3>💎 Монеты Чёрного рынка</h3><div class="status">Доступно владельцу и тех. админу. Выбери игрока и добавь ему виртуальные монеты либо установи точный баланс.</div><div class="mediaRow" style="margin-top:12px"><select id="marketPlayer" style="min-width:320px;background:#0d0d0f;color:#fff;border:1px solid #333;padding:11px;border-radius:8px"></select><input id="marketAmount" type="number" min="0" placeholder="Количество монет"><select id="marketMode" style="background:#0d0d0f;color:#fff;border:1px solid #333;padding:11px;border-radius:8px"><option value="add">Добавить к балансу</option><option value="set">Установить баланс</option></select><button class="btn" onclick="updateMarketWallet()">Применить</button></div><div class="status" id="marketWalletStatus" style="margin-top:10px">Загрузка игроков…</div></div><div class="mediaTools"><h3>🏘 Группы и доступ к командам</h3><div class="status" style="margin-bottom:10px">Переключатель действует на все команды бота, включая игровые. Новые группы по умолчанию получают доступ.</div><div id="ctlGroupList" class="status">Загрузка…</div></div><div class="mediaTools"><h3>👥 Пользователи бота</h3><div id="ctlUserList" class="status">Загрузка…</div></div></div><div id="changesPage" class="page"><div class="hero"><div class="eyebrow">SHINOBI CHANGELOG</div><h2>История изменений</h2><div class="muted">Что менялось в боте и веб-панели — по датам.</div></div><div id="changesList"><div class="empty">Загрузка…</div></div></div><div id="chatPage" class="page"><div class="hero"><div class="eyebrow">LIVE CHAT ANALYTICS</div><h2>Сводка чатов</h2><div class="muted">Статистика собирается ботом отдельно для каждого установленного чата.</div></div><div id="chatSummaryBox" class="infoGrid"><div class="empty">Загрузка…</div></div><div class="status" style="margin-top:14px">🟢 «Активны» = уникальные пользователи, от которых бот видел сообщения за последние 15 минут. Telegram Bot API не предоставляет точный список online-пользователей группы.</div></div></main><script>
 let reports=[],current=null;const labels={'overview.json':'Обзор','shinobi_links_log.xlsx':'Результаты и приглашения','work_schedules.xlsx':'График сотрудников','day_off_requests.xlsx':'Заявки на выходные','data.json':'Полная база бота','admin_assignments.json':'Данные обязанностей','user_timezones.json':'Часовые пояса'};
@@ -520,6 +534,12 @@ async function loadGrowth(){
  let [ar,jr]=await Promise.all([fetch('/api/referrals'),fetch('/api/joins-analytics?days=30')]);
  if(jr.ok){let j=await jr.json();document.getElementById('joinsToday').textContent=j.today||0;document.getElementById('joinsYesterday').textContent=j.yesterday||0;let d=Number(j.delta||0);document.getElementById('joinsDelta').textContent=(d>0?'+':'')+d;document.getElementById('joinsPeriod').textContent=j.period_total||0;let ctx=document.getElementById('joinsChart');if(joinsChartInstance)joinsChartInstance.destroy();joinsChartInstance=new Chart(ctx,{type:'line',data:{labels:(j.series||[]).map(x=>x.date.slice(5).split('-').reverse().join('.')),datasets:[{label:'Входы',data:(j.series||[]).map(x=>x.joins),borderWidth:2,tension:.28,fill:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:'#aaa'}}},scales:{x:{ticks:{color:'#777'},grid:{color:'#1d1d20'}},y:{beginAtZero:true,ticks:{color:'#777',precision:0},grid:{color:'#1d1d20'}}}}});}
  let box=document.getElementById('referralRanking');if(!ar.ok){box.innerHTML='<div class="empty">Ошибка загрузки ссылок</div>';return}let a=await ar.json(),rows=a.links||[];box.innerHTML='<div style="overflow:auto"><table><tr><th>#</th><th>Владелец</th><th>Ссылка</th><th>Приглашено</th><th>Действие</th></tr>'+rows.map((x,i)=>`<tr><td>${i+1}</td><td>${escapeHtml(x.username?'@'+x.username:(x.name||'Без имени'))}</td><td style="max-width:420px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(x.link||'')}</td><td><b>${x.invited||0}</b></td><td>${x.type==='advertising'?'<span class="status">Системная</span>':`<button class="navbtn" onclick='deleteReferral(${JSON.stringify(x.link)})'>Удалить</button>`}</td></tr>`).join('')+'</table></div>';hubFilterTable('referralRanking',document.getElementById('hubReferralFilter')?.value||'');
+}
+async function createReferralFromSite(){
+ const btn=document.getElementById('createReferralBtn'),status=document.getElementById('createReferralStatus'),label=document.getElementById('referralLabel')?.value||'';
+ if(!btn||btn.disabled)return;btn.disabled=true;status.textContent='Создаю ссылку…';
+ try{const r=await fetch('/api/referrals/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label})});let j={};try{j=await r.json()}catch(e){}if(!r.ok){status.textContent='Ошибка: '+(j.message||j.error||r.status);return}status.innerHTML='✅ Ссылка создана: <a href="'+escapeHtml(j.link)+'" target="_blank" rel="noopener">'+escapeHtml(j.link)+'</a> <button class="btn hub-secondary" type="button" onclick="navigator.clipboard.writeText('+JSON.stringify(j.link)+').then(()=>{document.getElementById(\'createReferralStatus\').textContent=\'Ссылка скопирована\'})">Скопировать</button>';if(label)document.getElementById('referralLabel').value='';await loadGrowth();}
+ catch(e){status.textContent='Не удалось связаться с сервером'}finally{btn.disabled=false}
 }
 async function deleteReferral(link){if(!confirm('Удалить эту персональную ссылку? Она также будет отозвана в Telegram, если Bot API разрешит.'))return;let r=await fetch('/api/referrals/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({link})});let j={};try{j=await r.json()}catch(e){};if(!r.ok){alert('Ошибка: '+(j.error||r.status));return}loadGrowth()}
 
@@ -665,7 +685,8 @@ async def _oidc_discovery():
     return data
 
 async def login_page(request):
-    if _read_session(request):raise web.HTTPFound('/dashboard')
+    if await asyncio.to_thread(hub_auth.session, request.cookies.get("shinobi_session", "")):
+        raise web.HTTPFound('/dashboard')
     configured=_oidc_settings() is not None
     action='<a class="btn" href="/auth/telegram/start">✈ Войти через Telegram</a>' if configured else '<div class="tip">Авторизация ещё не настроена. Укажите TELEGRAM_CLIENT_ID, TELEGRAM_CLIENT_SECRET и HUB_PUBLIC_URL в Railway.</div>'
     html = """<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Shinobi Team Hub — Telegram Login</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(ellipse at 20% 10%,#bde5ff,#f8fcff 65%);font:16px system-ui;color:#24506e}.card{max-width:390px;margin:20px;padding:38px;text-align:center;border:1px solid #ffffffaa;border-radius:28px;background:#ffffffa8;box-shadow:0 18px 50px #5490b22e;backdrop-filter:blur(25px)}h1{color:#157fbe}.btn{display:block;margin:25px 0 8px;padding:16px;border-radius:14px;color:white;background:#229ed9;text-decoration:none;font-weight:700;box-shadow:0 10px 24px #229ed944}.btn:hover{background:#1689c3}.tip{padding:16px;border-radius:14px;background:#e5f5ff;margin-top:20px;line-height:1.65}.note{font-size:12px;opacity:.7}</style><div class="card"><h1>SHINOBI TEAM HUB</h1><p>Защищённый вход для администрации</p>"""+action+"""<p class="note">Доступ только сотрудникам Shinobi Team. Подтвердите вход через Telegram.</p></div></html>"""
@@ -679,7 +700,7 @@ async def oidc_start(request):
     except Exception as exc:
         print('[OIDC DISCOVERY ERROR]',repr(exc))
         return web.Response(text='Не удалось подключиться к Telegram Login.',status=502)
-    state,verifier=hub_auth.oidc_state_create()
+    state,verifier=await asyncio.to_thread(hub_auth.oidc_state_create)
     challenge=base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b'=').decode()
     params={'response_type':'code','client_id':client_id,'redirect_uri':redirect,'scope':'openid profile','state':state,'code_challenge':challenge,'code_challenge_method':'S256'}
     response=web.HTTPFound(discovery['authorization_endpoint']+'?'+urlencode(params))
@@ -693,7 +714,7 @@ async def oidc_callback(request):
     state=request.query.get('state','')
     if not state or not secrets.compare_digest(state,request.cookies.get('hub_oidc_state','')):
         return web.Response(text='Недействительное состояние авторизации. Начните вход заново.',status=403)
-    verifier=hub_auth.oidc_state_consume(state)
+    verifier=await asyncio.to_thread(hub_auth.oidc_state_consume,state)
     if not verifier:return web.Response(text='Запрос входа уже использован или устарел.',status=403)
     code=request.query.get('code','')
     if not code:return web.Response(text='Telegram не подтвердил вход.',status=403)
@@ -720,7 +741,7 @@ async def oidc_callback(request):
         uid=int(raw_uid)
         if not 1 <= uid <= 1099511627775:
             raise ValueError('Verified Telegram user ID outside Bot API user ID range')
-        session=hub_auth.oidc_session_create(uid,request.remote or '')
+        session=await asyncio.to_thread(hub_auth.oidc_session_create,uid,request.remote or '')
         if not session:return web.Response(text='Доступ запрещён: этот Telegram-аккаунт не назначен сотрудником Shinobi Team. Проверьте Telegram ID аккаунта и HUB_OWNER_IDS в Railway. Подробности — в Railway Logs ([HUB OIDC ACCESS DENIED]).',status=403,content_type='text/plain',charset='utf-8')
     except Exception as exc:
         print('[TELEGRAM OIDC LOGIN ERROR]',type(exc).__name__,str(exc)[:150])
@@ -732,14 +753,14 @@ async def oidc_callback(request):
 
 async def telegram_login(request):
     token=request.query.get('token','')
-    session=hub_auth.redeem(token,request.remote or '')
+    session=await asyncio.to_thread(hub_auth.redeem,token,request.remote or '')
     if not session:return web.Response(text='Ссылка недействительна, использована или срок истёк. Запросите новую через /start.',status=403)
     response=web.HTTPFound('/dashboard')
     response.set_cookie('shinobi_session',session,httponly=True,secure=True,samesite='Lax',max_age=43200,path='/')
     raise response
 
 async def logout(request):
-    hub_auth.revoke(request.cookies.get('shinobi_session',''),request.remote or '')
+    await asyncio.to_thread(hub_auth.revoke,request.cookies.get('shinobi_session',''),request.remote or '')
     response=web.HTTPFound('/')
     response.del_cookie('shinobi_session',path='/')
     raise response
@@ -751,38 +772,39 @@ async def dashboard(request):
     html=DASHBOARD_HTML.replace('__ROLE__',f'{role.upper()} · ID {session["uid"]}')
     tech_nav='<button class="navbtn" onclick="showPage(\'octoberPage\',this);loadOctoberPlan()">📅 План на октябрь</button>' if role in ('owner','deputy') else ''
     tech_nav += '<button class="navbtn" onclick="showPage(\'techOpsPage\',this);techOpsLoad()">🛠 Тех. панель</button>' if role in ('owner','deputy','tech_admin') else ''
-    return web.Response(text=html.replace('__TECH_NAV__',tech_nav),content_type='text/html')
+    link_creation = '<div class="hub-link-create"><div><b>Создать свою пригласительную ссылку</b><div class="muted">Ссылка будет закреплена за вашим Telegram ID. Вход — по заявке.</div></div><div class="hub-link-create-controls"><input id="referralLabel" maxlength="32" placeholder="Название (необязательно)"><button id="createReferralBtn" class="btn hub-create-link" onclick="createReferralFromSite()">🔗 Создать ссылку</button></div><div id="createReferralStatus" class="status"></div></div>' if role in ('owner','deputy','admin') else ''
+    return web.Response(text=html.replace('__TECH_NAV__',tech_nav).replace('__LINK_CREATE__',link_creation),content_type='text/html')
 
 async def login_audit(request):
-    return web.json_response({'events':hub_auth.recent()})
+    return web.json_response({'events':await asyncio.to_thread(hub_auth.recent)})
 
 async def revoke_user_api(request):
     body=await request.json()
     try:uid=int(body['uid'])
     except (KeyError,TypeError,ValueError):return web.json_response({'error':'uid required'},status=400)
-    hub_auth.revoke_user(uid)
+    await asyncio.to_thread(hub_auth.revoke_user,uid)
     return web.json_response({'ok':True,'uid':uid})
 
 async def sessions_api(request):
-    return web.json_response({'sessions':hub_auth.active_sessions()})
+    return web.json_response({'sessions':await asyncio.to_thread(hub_auth.active_sessions)})
 
 async def revoke_others_api(request):
     session=_read_session(request)
     if not session:return web.json_response({'error':'unauthorized'},status=401)
-    hub_auth.revoke_other_sessions(session['uid'],request.cookies.get('shinobi_session',''))
+    await asyncio.to_thread(hub_auth.revoke_other_sessions,session['uid'],request.cookies.get('shinobi_session',''))
     return web.json_response({'ok':True})
 
 async def staff_api(request):
     if (_read_session(request) or {}).get('role') != 'owner':
         return web.json_response({'error':'forbidden'},status=403)
-    return web.json_response({'staff':hub_auth.staff_list()})
+    return web.json_response({'staff':await asyncio.to_thread(hub_auth.staff_list)})
 
 async def staff_role_api(request):
     data=await request.json()
     try:
         uid=int(data['uid']);new_role=str(data['role'])
         if uid<=0:raise ValueError('invalid uid')
-        hub_auth.set_staff_role(uid,new_role)
+        await asyncio.to_thread(hub_auth.set_staff_role,uid,new_role)
     except (KeyError,TypeError,ValueError) as e:
         return web.json_response({'error':str(e)},status=400)
     return web.json_response({'ok':True,'uid':uid,'role':new_role})
@@ -992,6 +1014,62 @@ async def referrals_api(request):
         })
     rows.sort(key=lambda x: (-x["invited"], str(x["name"]).lower()))
     return web.json_response({"links": rows}, dumps=lambda x: json.dumps(x, ensure_ascii=False))
+
+async def referral_create(request):
+    session = _read_session(request)
+    if not session or session.get("role") not in ("owner", "deputy", "admin"):
+        return web.json_response({"error": "admin_only"}, status=403)
+    token = os.getenv("BOT_TOKEN", "").strip()
+    chat_id = os.getenv("CHAT_ID", "-1004368701081").strip()
+    if not token:
+        return web.json_response({"error": "bot_token_not_configured", "message": "Не настроен BOT_TOKEN."}, status=503)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    uid = int(session["uid"])
+    label = str(payload.get("label", "")).strip()[:32]
+    invite_name = label or f"Admin {uid}"[:32]
+    try:
+        async with aiohttp.ClientSession() as session_http:
+            async with session_http.post(
+                f"https://api.telegram.org/bot{token}/createChatInviteLink",
+                json={"chat_id": chat_id, "name": invite_name, "creates_join_request": True},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as response:
+                result = await response.json()
+        if not result.get("ok"):
+            description = str(result.get("description", "Telegram не создал ссылку."))[:300]
+            return web.json_response({"error": "telegram_create_failed", "message": description}, status=502)
+        invite = result.get("result") or {}
+        link = str(invite.get("invite_link", ""))
+        if not link:
+            return web.json_response({"error": "telegram_invalid_response"}, status=502)
+    except Exception as exc:
+        print("[WEB REFERRAL CREATE]", type(exc).__name__, str(exc)[:200])
+        return web.json_response({"error": "telegram_unavailable", "message": "Не удалось связаться с Telegram. Попробуйте ещё раз."}, status=502)
+
+    # Keep the running bot's in-memory copy in sync with the durable JSON copy.
+    d = _bot_data_read()
+    runtime_data = None
+    try:
+        import sys
+        runtime_data = getattr(sys.modules.get("__main__"), "data", None)
+    except Exception:
+        pass
+    if isinstance(runtime_data, dict):
+        d = runtime_data
+    users = d.setdefault("users", {})
+    user = users.setdefault(str(uid), {"id": uid, "name": "", "username": "", "links": [], "total_invited": 0, "invited_users": []})
+    user.setdefault("links", [])
+    info = {"owner_id": uid, "type": "referral", "label": label or f"Админ {uid}", "created": datetime.now().isoformat(), "invited": 0, "users": [], "join_request": True}
+    d.setdefault("links", {})[link] = info
+    if link not in user["links"]:
+        user["links"].append(link)
+    await asyncio.to_thread(_bot_data_write, d)
+    return web.json_response({"ok": True, "link": link, "owner_id": uid, "created": info["created"]}, dumps=lambda x: json.dumps(x, ensure_ascii=False))
 
 async def referral_delete(request):
     session = _read_session(request)
@@ -1421,6 +1499,7 @@ async def start_stats_api():
     app.router.add_get("/api/reports", reports)
     app.router.add_get("/api/control", control_snapshot)
     app.router.add_get("/api/referrals", referrals_api)
+    app.router.add_post("/api/referrals/create", referral_create)
     app.router.add_post("/api/referrals/delete", referral_delete)
     app.router.add_get("/api/joins-analytics", joins_analytics_api)
     app.router.add_get("/api/changelog", changelog_api)

@@ -4,6 +4,7 @@ from pathlib import Path
 
 DB_PATH = Path(__file__).with_name('hub_auth.sqlite3')
 LOCK = threading.RLock()
+_INITIALIZED = False
 ROLES = ('owner','deputy','admin','moderator')
 IDLE_TIMEOUT = 30 * 60
 SESSION_MAX_AGE = 12 * 60 * 60
@@ -30,15 +31,23 @@ def _execute(sql,args=(),fetch=False):
         finally: c.close()
 
 def init():
-    _execute('CREATE TABLE IF NOT EXISTS hub_login_tokens (digest TEXT PRIMARY KEY, uid BIGINT NOT NULL, expires BIGINT NOT NULL, consumed BIGINT)')
-    _execute('CREATE TABLE IF NOT EXISTS hub_sessions (digest TEXT PRIMARY KEY, uid BIGINT NOT NULL, expires BIGINT NOT NULL, revoked BIGINT)')
-    # Safe migration for existing PostgreSQL and SQLite installations.
-    try:_execute('ALTER TABLE hub_sessions ADD COLUMN last_seen BIGINT')
-    except Exception:pass
-    _execute('CREATE TABLE IF NOT EXISTS hub_oidc_states (digest TEXT PRIMARY KEY, verifier TEXT NOT NULL, expires BIGINT NOT NULL, consumed BIGINT)')
-    _execute('CREATE TABLE IF NOT EXISTS hub_staff_roles (uid BIGINT PRIMARY KEY, role TEXT NOT NULL, updated_at BIGINT NOT NULL)')
-    _execute('CREATE TABLE IF NOT EXISTS hub_staff_roles (uid BIGINT PRIMARY KEY, role TEXT NOT NULL, updated_at BIGINT NOT NULL)')
-    _execute('CREATE TABLE IF NOT EXISTS hub_login_audit (id BIGINT PRIMARY KEY, uid BIGINT NOT NULL, event TEXT NOT NULL, at BIGINT NOT NULL, ip TEXT)')
+    global _INITIALIZED
+    if _INITIALIZED:
+        return
+    # These schema checks are needed once per process, not on every dashboard
+    # request. Repeating DDL on every session lookup can stall the bot's event loop.
+    with LOCK:
+        if _INITIALIZED:
+            return
+        _execute('CREATE TABLE IF NOT EXISTS hub_login_tokens (digest TEXT PRIMARY KEY, uid BIGINT NOT NULL, expires BIGINT NOT NULL, consumed BIGINT)')
+        _execute('CREATE TABLE IF NOT EXISTS hub_sessions (digest TEXT PRIMARY KEY, uid BIGINT NOT NULL, expires BIGINT NOT NULL, revoked BIGINT)')
+        # Safe migration for existing PostgreSQL and SQLite installations.
+        try:_execute('ALTER TABLE hub_sessions ADD COLUMN last_seen BIGINT')
+        except Exception:pass
+        _execute('CREATE TABLE IF NOT EXISTS hub_oidc_states (digest TEXT PRIMARY KEY, verifier TEXT NOT NULL, expires BIGINT NOT NULL, consumed BIGINT)')
+        _execute('CREATE TABLE IF NOT EXISTS hub_staff_roles (uid BIGINT PRIMARY KEY, role TEXT NOT NULL, updated_at BIGINT NOT NULL)')
+        _execute('CREATE TABLE IF NOT EXISTS hub_login_audit (id BIGINT PRIMARY KEY, uid BIGINT NOT NULL, event TEXT NOT NULL, at BIGINT NOT NULL, ip TEXT)')
+        _INITIALIZED = True
 
 def role(uid):
     uid=str(uid)
