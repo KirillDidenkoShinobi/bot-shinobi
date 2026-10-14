@@ -562,7 +562,14 @@ async def oidc_callback(request):
         if not key_data:raise ValueError('Signing key not found')
         key=jwt.algorithms.RSAAlgorithm.from_jwk(key_data)
         claims=jwt.decode(encoded,key,algorithms=['RS256'],audience=client_id,issuer=discovery['issuer'],options={'require':['exp','iat','iss','aud','sub']},leeway=30)
-        uid=int(claims['sub'])
+        # Telegram OIDC `sub` is an OIDC subject, not the Bot API user ID.
+        # The verified `profile` claim `id` is the Telegram numeric user ID.
+        raw_uid=claims.get('id')
+        if isinstance(raw_uid,bool) or not isinstance(raw_uid,(int,str)) or not str(raw_uid).isascii() or not str(raw_uid).isdecimal():
+            raise ValueError('Verified Telegram ID token has no valid numeric id claim (profile scope required)')
+        uid=int(raw_uid)
+        if not 1 <= uid <= 1099511627775:
+            raise ValueError('Verified Telegram user ID outside Bot API user ID range')
         session=hub_auth.oidc_session_create(uid,request.remote or '')
         if not session:return web.Response(text='Доступ запрещён: этот Telegram-аккаунт не назначен сотрудником Shinobi Team. Проверьте Telegram ID аккаунта и HUB_OWNER_IDS в Railway. Подробности — в Railway Logs ([HUB OIDC ACCESS DENIED]).',status=403,content_type='text/plain',charset='utf-8')
     except Exception as exc:
