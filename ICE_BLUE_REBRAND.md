@@ -1,0 +1,1 @@
+Shinobi Team Hub white/ice-blue rebrand. Changed only inline CSS and site branding in stats_api.py. All bot logic, database and routes retained. Verify login, reports, charts and mobile UI after Railway deploy.
