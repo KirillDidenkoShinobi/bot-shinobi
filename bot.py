@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import json
 import os
 import time
@@ -3168,13 +3169,22 @@ async def _auto_approve_join_request(chat_id: int, user_id: int, delay: int = 10
 
 @dp.chat_join_request()
 async def join_request_handler(event: ChatJoinRequest):
+    logging.getLogger("shinobi.join").warning(
+        "[JOIN REQUEST RECEIVED] chat=%s user=%s link=%s",
+        event.chat.id, event.from_user.id,
+        (event.invite_link.invite_link if event.invite_link else "none")
+    )
     if event.chat.id != CHAT_ID:
+        logging.getLogger("shinobi.join").warning(
+            "[JOIN REQUEST IGNORED] chat=%s expected=%s", event.chat.id, CHAT_ID
+        )
         return
     key = _join_request_key(event.chat.id, event.from_user.id)
     existing = data.setdefault("pending_join_requests", {}).get(key)
     # Telegram/несколько update-путей могут прислать одно событие повторно.
     # Пока заявка активна, второй комплект карточек НЕ создаём.
     if existing and existing.get("status") == "pending" and any(m.get("place") == "staff" for m in (existing.get("messages") or [])):
+        logging.getLogger("shinobi.join").warning("[JOIN REQUEST DUPLICATE] user=%s already delivered", event.from_user.id)
         return
     # Если старая заявка была сохранена, но уведомление не дошло — отправляем повторно.
 
@@ -3225,6 +3235,7 @@ async def join_request_handler(event: ChatJoinRequest):
         try:
             msg = await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
             req["messages"].append({"chat_id": chat_id, "message_id": msg.message_id, "place": place})
+            logging.getLogger("shinobi.join").warning("[JOIN REQUEST DELIVERED] place=%s chat=%s user=%s", place, chat_id, event.from_user.id)
             return
         except Exception as exc:
             import logging
@@ -5205,9 +5216,9 @@ async def main():
     print("Удаляю старый webhook...")
 
     # Удаляем webhook перед запуском polling
-    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.delete_webhook(drop_pending_updates=False)
 
-    print("Webhook удалён.")
+    print("Webhook удалён; ожидающие обновления Telegram сохранены.")
     print("=" * 50)
     print(" SHINOBI TEAM REFERRAL BOT")
     print(" БОТ ЗАПУЩЕН")
