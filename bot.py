@@ -65,12 +65,12 @@ CHAT_ID = -1004368701081
 
 # ID администраторов, которым доступна админ-панель
 OWNER_IDS = [1197818066]
-ADMIN_IDS = OWNER_IDS.copy()
+ADMIN_IDS = sorted(set(OWNER_IDS + [int(x.strip()) for x in os.getenv("SHINOBI_ADMIN_IDS", "").split(",") if x.strip().isdigit()]))
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(BASE_DIR, "data.json")
 EXCEL_FILE = os.path.join(BASE_DIR, "shinobi_links_log.xlsx")
-ADVERTISING_LINK = "https://t.me/+xXGHYqokIiMzNjYy"
+ADVERTISING_LINK = "https://t.me/+xXGHYqokIiMzNjYy"  # legacy default, do not overwrite persisted link
 ADMIN_STAFF_CHAT_ID = -1004462686385
 ERROR_DELETE_AFTER = 15
 WEBAPP_URL = os.getenv("SHINOBI_WEBAPP_URL", "").strip()
@@ -1414,6 +1414,8 @@ def load_data():
 data = load_data()
 
 # Фиксированная рекламная ссылка Shinobi Team. Сохраняем её как отдельный источник.
+# Preserve saved advertising link; never overwrite it on every restart.
+ADVERTISING_LINK = data.get("advertising_link") or ADVERTISING_LINK
 data["advertising_link"] = ADVERTISING_LINK
 data.setdefault("links", {})
 _ad_info = data["links"].setdefault(ADVERTISING_LINK, {})
@@ -2887,7 +2889,7 @@ async def menu_handler(message: Message):
 # СОЗДАНИЕ РЕФЕРАЛЬНОЙ ССЫЛКИ
 # =========================================================
 
-async def _send_created_link(tg_user, target, creates_join_request: bool = False):
+async def _send_created_link(tg_user, target, creates_join_request: bool = True):
     user = update_user(tg_user)
     link_number = len(user["links"]) + 1
 
@@ -2895,7 +2897,7 @@ async def _send_created_link(tg_user, target, creates_join_request: bool = False
         invite = await bot.create_chat_invite_link(
             chat_id=CHAT_ID,
             name=f"REF_{tg_user.id}_{link_number}",
-            creates_join_request=creates_join_request
+            creates_join_request=True
         )
     except Exception as error:
         text = (
@@ -2916,12 +2918,12 @@ async def _send_created_link(tg_user, target, creates_join_request: bool = False
         "created": datetime.now().isoformat(),
         "invited": 0,
         "users": [],
-        "join_request": bool(creates_join_request)
+        "join_request": True
     }
     user["links"].append(link)
     save_data()
 
-    mode = "📩 По заявке" if creates_join_request else "⚡ Вход сразу"
+    mode = "📩 По заявке"
     text = (
         "🔗 <b>НОВАЯ РЕФЕРАЛЬНАЯ ССЫЛКА</b>\n\n"
         f"{link}\n\n"
@@ -2951,7 +2953,7 @@ async def create_link_mode_callback(callback: CallbackQuery):
         await callback.answer("Нет доступа.", show_alert=True)
         return
     await callback.answer("Создаю ссылку...")
-    await _send_created_link(callback.from_user, callback, callback.data == "create_link_request")
+    await _send_created_link(callback.from_user, callback, True)
 
 
 # =========================================================
@@ -3006,6 +3008,40 @@ async def link_callback(callback: CallbackQuery):
 # ЕДИНАЯ ССЫЛКА ДЛЯ РЕКЛАМЫ
 # =========================================================
 
+async def _rotate_advertising_link():
+    """Create a new link without revoking unrelated staff links; keep old stats."""
+    global ADVERTISING_LINK
+    invite = await bot.create_chat_invite_link(chat_id=CHAT_ID, name="Shinobi advertising", creates_join_request=True)
+    new_link = invite.invite_link
+    old_link = data.get("advertising_link") or ADVERTISING_LINK
+    old_info = data.setdefault("links", {}).get(old_link, {})
+    data["links"][new_link] = {
+        "owner_id": None, "type": "advertising", "label": "Рекламная ссылка",
+        "created": datetime.now().isoformat(), "invited": 0, "users": [],
+        "join_request": True, "previous_link": old_link,
+    }
+    # Do not revoke or erase the old link: its historical counts remain intact.
+    data["advertising_link"] = new_link
+    ADVERTISING_LINK = new_link
+    save_data()
+    return new_link, old_link, int(old_info.get("invited", 0) or 0)
+
+@dp.callback_query(F.data == "ad_link_rotate")
+async def advertising_link_rotate(callback: CallbackQuery):
+    if callback.from_user.id not in OWNER_IDS:
+        await callback.answer("Только владельцу", show_alert=True)
+        return
+    await callback.answer("Создаю новую ссылку...")
+    try:
+        new_link, old_link, old_count = await _rotate_advertising_link()
+    except Exception as exc:
+        await callback.message.answer("❌ Не удалось создать ссылку. Проверь право бота приглашать пользователей.\n" + html.escape(str(exc)[:500]), parse_mode="HTML")
+        return
+    await callback.message.answer(
+        "✅ <b>Новая рекламная ссылка создана</b>\n" + html.escape(new_link) +
+        "\n\nСтарая ссылка и её статистика сохранены (" + str(old_count) + " приглашений).",
+        parse_mode="HTML", disable_web_page_preview=True)
+
 @dp.callback_query(F.data == "advertising_link")
 async def advertising_link_callback(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -3023,6 +3059,7 @@ async def advertising_link_callback(callback: CallbackQuery):
         [InlineKeyboardButton(text="➕ Добавить", callback_data="ad_inv_add"),
          InlineKeyboardButton(text="➖ Отнять", callback_data="ad_inv_sub")],
         [InlineKeyboardButton(text="✏️ Установить число", callback_data="ad_inv_set")],
+        [InlineKeyboardButton(text="🔄 Создать новую рабочую ссылку", callback_data="ad_link_rotate")],
         [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="admin_panel")]
     ])
     await callback.answer()
@@ -3187,14 +3224,18 @@ async def join_request_handler(event: ChatJoinRequest):
         try:
             msg = await bot.send_message(admin_id, text, reply_markup=kb, parse_mode="HTML")
             req["messages"].append({"chat_id": admin_id, "message_id": msg.message_id, "place": "dm"})
-        except Exception:
-            pass
+        except Exception as exc:
+            import logging
+            logging.getLogger("shinobi.delivery").error("Заявка: ЛС админу %s: %s", admin_id, exc)
+            req.setdefault("delivery_errors", []).append(f"ЛС {admin_id}: {str(exc)[:160]}")
     # И ровно одна карточка в Staff.
     try:
         msg = await bot.send_message(ADMIN_STAFF_CHAT_ID, text, reply_markup=kb, parse_mode="HTML")
         req["messages"].append({"chat_id": ADMIN_STAFF_CHAT_ID, "message_id": msg.message_id, "place": "staff"})
-    except Exception:
-        pass
+    except Exception as exc:
+        import logging
+        logging.getLogger("shinobi.delivery").error("Заявка: Staff %s: %s", ADMIN_STAFF_CHAT_ID, exc)
+        req.setdefault("delivery_errors", []).append(f"Staff: {str(exc)[:160]}")
     save_data()
 
 
@@ -4209,18 +4250,33 @@ def maintenance_menu_text():
 
 
 async def send_maintenance_notice(text: str):
-    # Личные сообщения всем администраторам.
-    for admin_id in set(ADMIN_IDS):
+    """Deliver to all configured admins and Staff; return truthful delivery summary."""
+    import logging
+    logger = logging.getLogger("shinobi.delivery")
+    successes, failures = [], []
+    for admin_id in sorted(set(ADMIN_IDS)):
         try:
             await bot.send_message(admin_id, text, parse_mode="HTML")
-        except Exception:
-            pass
-
-    # Общее сообщение в Admin Staff.
+            successes.append(f"ЛС {admin_id}")
+        except Exception as exc:
+            logger.error("Не доставлено в ЛС %s: %s", admin_id, exc)
+            failures.append(f"ЛС {admin_id}: {str(exc)[:140]}")
     try:
         await bot.send_message(ADMIN_STAFF_CHAT_ID, text, parse_mode="HTML")
-    except Exception:
-        pass
+        successes.append("Admin Staff")
+    except Exception as exc:
+        logger.error("Не доставлено в Staff %s: %s", ADMIN_STAFF_CHAT_ID, exc)
+        failures.append(f"Staff: {str(exc)[:140]}")
+    return successes, failures
+
+
+@dp.message(Command("delivery_test"))
+async def delivery_test(message: Message):
+    if message.from_user.id not in OWNER_IDS or message.chat.type != "private":
+        return
+    ok, errors = await send_maintenance_notice("🧪 <b>Проверка доставки Shinobi Team</b>")
+    await message.answer("📨 Проверка уведомлений\nУспешно: " + (", ".join(ok) or "нет") +
+                         "\nОшибки: " + ("; ".join(errors) or "нет"))
 
 
 @dp.message(F.text == "🛠 Тех. работы")
@@ -4291,12 +4347,13 @@ async def maintenance_start_confirm_callback(callback: CallbackQuery):
         "если бот отвечает с задержкой.\n\n"
         "🥷 После завершения работ администрация получит отдельное уведомление."
     )
-    await send_maintenance_notice(notice)
+    delivered, failed = await send_maintenance_notice(notice)
 
     await callback.answer("Технические работы запущены.")
     await callback.message.edit_text(
         "🛠 <b>Технические работы запущены.</b>\n\n"
-        "📨 Уведомление отправлено администраторам и в Admin Staff.",
+        f"📨 Доставлено: {len(delivered)}. Ошибок: {len(failed)}.\n" +
+        ("\n".join(html.escape(x) for x in failed) if failed else "Все доставки успешны."),
         reply_markup=maintenance_keyboard(),
         parse_mode="HTML"
     )
@@ -4320,12 +4377,13 @@ async def maintenance_finish_callback(callback: CallbackQuery):
         "⚙️ Основные функции доступны для использования.\n"
         "🥷 Спасибо за ожидание."
     )
-    await send_maintenance_notice(notice)
+    delivered, failed = await send_maintenance_notice(notice)
 
     await callback.answer("Технические работы завершены.")
     await callback.message.edit_text(
         "✅ <b>Технические работы завершены.</b>\n\n"
-        "📨 Администрация и Admin Staff получили уведомление.",
+        f"📨 Доставлено: {len(delivered)}. Ошибок: {len(failed)}.\n" +
+        ("\n".join(html.escape(x) for x in failed) if failed else "Все доставки успешны."),
         reply_markup=maintenance_keyboard(),
         parse_mode="HTML"
     )
