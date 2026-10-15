@@ -1013,6 +1013,20 @@ def _game_chat_allowed(chat_id: int) -> bool:
     except (TypeError, ValueError):
         return False
 
+OWNER_GLOBAL_GAME_COMMANDS = {".дрочь", ".дроч", ".топ хуёв", ".топ хуев", ".мой хуй"}
+
+def _owner_global_game_access(event):
+    if not getattr(event, "from_user", None) or int(event.from_user.id) not in OWNER_IDS:
+        return False
+    command = " ".join((event.text or "").strip().casefold().split())
+    if command not in OWNER_GLOBAL_GAME_COMMANDS:
+        return False
+    try:
+        from db_storage import get_setting
+        return get_setting("owner_global_game_commands", False) is True
+    except Exception:
+        return False
+
 GAME_COMMAND_PREFIXES = (
     ".рынок", ".акции", ".купить", ".портфель",
     ".досье", ".анкета", ".матч", ".mlbb", ".шиноби", ".фарм", ".рынок график",
@@ -1064,7 +1078,7 @@ class GroupCommandAccessMiddleware(BaseMiddleware):
             # общим переключателем команд на сайте.
             # Игровые команды работают только в GAME_COMMAND_ALLOWED_CHAT_ID.
             if _is_game_command(text):
-                if not _game_chat_allowed(event.chat.id):
+                if not _game_chat_allowed(event.chat.id) and not _owner_global_game_access(event):
                     # В основном чате не выполняем игровую команду, а раз в 4 часа
                     # на пользователя подсказываем, где она доступна.
                     if int(event.chat.id) == CHAT_ID and event.from_user:

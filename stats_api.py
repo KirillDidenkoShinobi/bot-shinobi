@@ -194,6 +194,7 @@ WRITE_ROLES = {
     "/api/control/group-access": {"owner", "deputy", "tech_admin"},
     "/api/control/server-tags": {"owner", "deputy", "tech_admin"},
     "/api/control/auto-reactions": {"owner", "deputy", "tech_admin"},
+    "/api/control/owner-game": {"owner"},
     "/api/market/wallet": {"owner"},
     "/api/backup/full": {"owner"},
     "/api/system/version": {"owner"},
@@ -773,7 +774,21 @@ async def dashboard(request):
     tech_nav='<button class="navbtn" onclick="showPage(\'octoberPage\',this);loadOctoberPlan()">📅 План на октябрь</button>' if role in ('owner','deputy') else ''
     tech_nav += '<button class="navbtn" onclick="showPage(\'techOpsPage\',this);techOpsLoad()">🛠 Тех. панель</button>' if role in ('owner','deputy','tech_admin') else ''
     link_creation = '<div class="hub-link-create"><div><b>Создать свою пригласительную ссылку</b><div class="muted">Ссылка будет закреплена за вашим Telegram ID. Вход — по заявке.</div></div><div class="hub-link-create-controls"><input id="referralLabel" maxlength="32" placeholder="Название (необязательно)"><button id="createReferralBtn" class="btn hub-create-link" onclick="createReferralFromSite()">🔗 Создать ссылку</button></div><div id="createReferralStatus" class="status"></div></div>' if role in ('owner','deputy','admin') else ''
-    return web.Response(text=html.replace('__TECH_NAV__',tech_nav).replace('__LINK_CREATE__',link_creation),content_type='text/html')
+    html = html.replace('__TECH_NAV__', tech_nav).replace('__LINK_CREATE__', link_creation)
+    html = html.replace('</div><div id="aiModPage"', '<button class="navbtn" onclick="showPage(\'dailyNormPage\',this);loadDailyNorm()">📊 Норма дня</button></div><div id="aiModPage"', 1)
+    norm_html = """<div id="dailyNormPage" class="page"><div class="hero"><h2>📊 Норма дня</h2><div class="muted">Подтверждённые вступления по персональным ссылкам • цель 15 в день</div></div><div class="mediaTools"><label>Выбрать дату: <input type="date" id="dailyNormDate" onchange="loadDailyNorm()"></label><button class="btn hub-secondary" onclick="loadDailyNorm()">Обновить</button><div id="dailyNormSummary" class="status"></div><div id="dailyNormRows"></div></div></div>"""
+    html = html.replace('<div id="aiModPage"', norm_html + '<div id="aiModPage"', 1)
+    js = """<script>
+async function loadDailyNorm(){const field=document.getElementById('dailyNormDate');if(!field.value){const now=new Date();field.value=now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0')}const box=document.getElementById('dailyNormRows');box.textContent='Загрузка…';try{const r=await fetch('/api/norma-day?date='+encodeURIComponent(field.value));if(!r.ok)throw Error('HTTP '+r.status);const j=await r.json();document.getElementById('dailyNormSummary').textContent='Всего за день: '+j.total+' / '+j.goal;box.innerHTML=(j.rows||[]).map(a=>'<div class="panel" style="margin:12px 0;padding:16px"><b>'+escapeHtml(a.name)+'</b> · <b>'+a.count+' / '+a.goal+'</b><div style="height:9px;background:#293346;border-radius:12px;margin:10px 0;overflow:hidden"><div style="height:100%;width:'+Math.min(100,100*a.count/a.goal)+'%;background:'+(a.count>=a.goal?'#16a34a':'#4598f0')+'"></div></div>'+(a.links||[]).map(l=>'<div style="margin:5px 0"><a href="'+escapeHtml(l.link)+'" target="_blank" rel="noopener">'+escapeHtml(l.label||l.link)+'</a> · Всего '+l.total+'</div>').join('')+'</div>').join('')||'<div class="empty">Нет администраторов с отслеживаемыми ссылками</div>'}catch(e){box.textContent='Ошибка загрузки: '+e.message}}
+async function loadOwnerGame(){const r=await fetch('/api/control/owner-game');if(!r.ok)return;const j=await r.json();document.getElementById('ownerGameState').textContent=j.enabled?'🟢 Включено':'🔴 Выключено';document.getElementById('ownerGameToggle').textContent=j.enabled?'Выключить':'Включить';document.getElementById('ownerGameToggle').dataset.enabled=j.enabled?'1':'0'}
+async function toggleOwnerGame(){const btn=document.getElementById('ownerGameToggle');const enabled=btn.dataset.enabled!=='1';const r=await fetch('/api/control/owner-game',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});if(!r.ok){alert('Не удалось изменить настройку');return}await loadOwnerGame()}
+</script>"""
+    html = html.replace('</body>', js + '</body>', 1)
+    if role == 'owner':
+        widget = '<div class="mediaTools"><h3>👑 Игровые команды владельца во всех чатах</h3><p class="muted">.дрочь, .мой хуй, .топ хуёв — только для владельца, даже в запрещённых чатах</p><div id="ownerGameState">Загрузка…</div><button class="btn" id="ownerGameToggle" onclick="toggleOwnerGame()">Изменить</button></div>'
+        html = html.replace('<div id="controlPage" class="page">', '<div id="controlPage" class="page">' + widget, 1)
+        html = html.replace('</body>', '<script>loadOwnerGame()</script></body>', 1)
+    return web.Response(text=html, content_type='text/html')
 
 async def login_audit(request):
     return web.json_response({'events':await asyncio.to_thread(hub_auth.recent)})
@@ -994,6 +1009,80 @@ async def control_snapshot(request):
         auto_reactions_enabled = True
     return web.json_response({'counts':{'users':len(users),'groups':len(groups),'tags':len(assignments)},'maintenance':bool(d.get('maintenance_mode')),'groups':groups,'users':users,'assignments':assignments,'server_tags':SERVER_TAGS,'server_tags_enabled':tag_enabled,'auto_reactions_enabled':auto_reactions_enabled},dumps=lambda x:json.dumps(x,ensure_ascii=False))
 
+
+async def owner_game_toggle(request):
+    session = _read_session(request)
+    if not session or session.get("role") != "owner":
+        return web.json_response({"error": "owner_only"}, status=403)
+    try:
+        payload = await request.json()
+        enabled = payload.get("enabled")
+        if not isinstance(enabled, bool):
+            return web.json_response({"error": "enabled_must_be_boolean"}, status=400)
+        from db_storage import set_setting
+        set_setting("owner_global_game_commands", enabled)
+        return web.json_response({"ok": True, "enabled": enabled})
+    except Exception as exc:
+        return web.json_response({"error": "settings_error", "detail": str(exc)}, status=500)
+
+async def owner_game_state(request):
+    session = _read_session(request)
+    if not session or session.get("role") != "owner":
+        return web.json_response({"error": "owner_only"}, status=403)
+    from db_storage import get_setting
+    return web.json_response({"enabled": get_setting("owner_global_game_commands", False) is True})
+
+async def daily_norm_api(request):
+    session = _read_session(request)
+    if not session:
+        return web.json_response({"error": "unauthorized"}, status=401)
+    from datetime import date, timedelta
+    day = request.query.get("date", date.today().isoformat())
+    try:
+        selected = date.fromisoformat(day)
+    except ValueError:
+        return web.json_response({"error": "invalid_date"}, status=400)
+    d = _bot_data_read()
+    users = d.get("users", {}) or {}
+    links = d.get("links", {}) or {}
+    staff_ids = set()
+    try:
+        staff = await asyncio.to_thread(hub_auth.staff_list)
+        if isinstance(staff, list):
+            for member in staff:
+                if isinstance(member, dict) and member.get("uid"):
+                    staff_ids.add(str(member["uid"]))
+    except Exception:
+        pass
+    for info in links.values():
+        if isinstance(info, dict) and info.get("owner_id") is not None and info.get("type") != "advertising":
+            staff_ids.add(str(info["owner_id"]))
+    # Existing dated join events are the only basis for historical counts.
+    # A user is counted once per administrator per day, even with multiple links.
+    joined = {}
+    for event in d.get("join_history", []):
+        if not isinstance(event, dict) or str(event.get("joined_at", ""))[:10] != day:
+            continue
+        info = links.get(event.get("invite_link", ""), {})
+        if not isinstance(info, dict) or info.get("type") == "advertising" or info.get("owner_id") is None:
+            continue
+        uid = str(info["owner_id"])
+        person = str(event.get("user_id", ""))
+        if person:
+            joined.setdefault(uid, set()).add(person)
+    rows = []
+    for uid in staff_ids:
+        if session.get("role") not in ("owner", "deputy", "tech_admin") and str(session.get("uid")) != uid:
+            continue
+        person = users.get(uid, {})
+        owned = [{"link": url, "label": info.get("label", ""), "total": int(info.get("invited", 0) or 0)}
+                 for url, info in links.items() if isinstance(info, dict) and str(info.get("owner_id")) == uid and info.get("type") != "advertising"]
+        rows.append({"uid": uid, "name": person.get("name") or person.get("full_name") or f"Админ {uid}",
+                     "username": person.get("username", ""), "count": len(joined.get(uid, set())), "goal": 15, "links": owned})
+    rows.sort(key=lambda x: (-x["count"], x["name"].casefold()))
+    return web.json_response({"date": day, "rows": rows, "total": sum(x["count"] for x in rows),
+                              "goal": sum(x["goal"] for x in rows), "timezone_note": "Даты определяются по времени записей join_history"},
+                             dumps=lambda x: json.dumps(x, ensure_ascii=False))
 
 async def referrals_api(request):
     d = _bot_data_read()
@@ -1499,6 +1588,9 @@ async def start_stats_api():
     app.router.add_get("/api/reports", reports)
     app.router.add_get("/api/control", control_snapshot)
     app.router.add_get("/api/referrals", referrals_api)
+    app.router.add_get("/api/norma-day", daily_norm_api)
+    app.router.add_get("/api/control/owner-game", owner_game_state)
+    app.router.add_post("/api/control/owner-game", owner_game_toggle)
     app.router.add_post("/api/referrals/create", referral_create)
     app.router.add_post("/api/referrals/delete", referral_delete)
     app.router.add_get("/api/joins-analytics", joins_analytics_api)
