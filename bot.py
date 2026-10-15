@@ -1016,7 +1016,7 @@ def _game_chat_allowed(chat_id: int) -> bool:
 GAME_COMMAND_PREFIXES = (
     ".рынок", ".акции", ".купить", ".портфель",
     ".досье", ".анкета", ".матч", ".mlbb", ".шиноби", ".фарм", ".рынок график",
-    ".продать", ".передать", ".подарить", ".дивиденды", ".рынок топ", ".рынок события",
+    ".продать", ".передать", ".подарить", ".дивиденды", ".рынок топ", ".рынок события", ".дрочь", ".дроч", ".топ хуёв", ".топ хуев", ".мой хуй",
 )
 
 def _is_game_command(text: str) -> bool:
@@ -1782,6 +1782,86 @@ def _market_top_text(chat_id: int) -> str:
 async def game_market(message: Message):
     if message.chat.type not in {"group", "supergroup"}: return
     await message.reply(_market_top_text(message.chat.id), parse_mode="HTML", reply_markup=_market_keyboard())
+
+@dp.message(F.text.casefold().in_({".дрочь", ".дроч"}))
+async def game_droch(message: Message):
+    if message.chat.type not in {"group", "supergroup"} or not message.from_user:
+        return
+    now = int(time.time())
+    key = f"{message.chat.id}:{message.from_user.id}"
+    state = data.setdefault("droch_game", {}).setdefault(key, {"cm": 10, "broken_until": 0})
+    state["name"] = message.from_user.full_name or str(message.from_user.id)
+    remaining = int(state.get("broken_until", 0)) - now
+    if remaining > 0:
+        minutes = (remaining + 59) // 60
+        await message.reply(f"🩹 У тебя всё ещё поломка! Отдыхай ещё <b>{minutes} мин.</b> и попробуй снова.", parse_mode="HTML")
+        return
+    current = max(0, int(state.get("cm", 10)))
+    roll = random.random()
+    if roll < 0.15:
+        state["broken_until"] = now + 2 * 60 * 60
+        text = "💥 Ой, перестарался! Теперь нужен отдых <b>2 часа</b>."
+    elif roll < 0.575:
+        change = random.randint(1, 20)
+        state["cm"] = current + change
+        text = f"📈 Удача! +<b>{change} см</b>! Теперь у тебя <b>{state['cm']} см</b>."
+    else:
+        change = random.randint(1, 20)
+        state["cm"] = max(0, current - change)
+        text = f"📉 Не повезло! −<b>{change} см</b>! Теперь у тебя <b>{state['cm']} см</b>."
+    save_data()
+    await message.reply(f"🎲 <b>Шиноби: рулетка размеров</b>\n\n{text}", parse_mode="HTML")
+
+
+@dp.message(F.text.casefold().in_({".топ хуёв", ".топ хуев"}))
+async def game_droch_top(message: Message):
+    if message.chat.type not in {"group", "supergroup"}:
+        return
+    prefix = f"{message.chat.id}:"
+    rows = []
+    for key, state in data.get("droch_game", {}).items():
+        if not key.startswith(prefix) or not isinstance(state, dict):
+            continue
+        uid = key[len(prefix):]
+        if not uid.isdigit():
+            continue
+        cm = max(0, int(state.get("cm", 10)))
+        name = state.get("name") or f"Игрок {uid}"
+        rows.append((cm, uid, str(name)))
+    rows.sort(key=lambda row: (-row[0], row[2].casefold()))
+    if not rows:
+        await message.reply("🏆 Рейтинг пока пуст. Используй <code>.дрочь</code>, чтобы начать!", parse_mode="HTML")
+        return
+    lines = ["🏆 <b>ТОП-15 SHINOBI ПО РАЗМЕРУ</b>", ""]
+    for place, (cm, uid, name) in enumerate(rows[:15], 1):
+        lines.append(f"{place}. {html.escape(name)} — <b>{cm} см</b>")
+    await message.reply("\n".join(lines), parse_mode="HTML")
+
+
+@dp.message(F.text.casefold() == ".мой хуй")
+async def game_droch_me(message: Message):
+    if message.chat.type not in {"group", "supergroup"} or not message.from_user:
+        return
+    key = f"{message.chat.id}:{message.from_user.id}"
+    state = data.get("droch_game", {}).get(key)
+    if not isinstance(state, dict):
+        await message.reply("🎲 Ты ещё не играл! Начни с <code>.дрочь</code>.", parse_mode="HTML")
+        return
+    prefix = f"{message.chat.id}:"
+    ranking = sorted(
+        ((max(0, int(v.get("cm", 10))), k) for k, v in data.get("droch_game", {}).items()
+         if k.startswith(prefix) and isinstance(v, dict)),
+        key=lambda row: (-row[0], row[1])
+    )
+    place = next((i for i, (_, k) in enumerate(ranking, 1) if k == key), None)
+    cm = max(0, int(state.get("cm", 10)))
+    remaining = max(0, int(state.get("broken_until", 0)) - int(time.time()))
+    status = f"🩹 Восстановление: {(remaining + 59) // 60} мин." if remaining else "✅ Готов к игре"
+    await message.reply(
+        f"📏 <b>Твой размер:</b> {cm} см\n🏆 <b>Место:</b> {place} из {len(ranking)}\n{status}",
+        parse_mode="HTML"
+    )
+
 
 @dp.message(F.text.casefold() == ".фарм")
 async def game_farm(message: Message):
